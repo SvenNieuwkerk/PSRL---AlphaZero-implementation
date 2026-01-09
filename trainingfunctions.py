@@ -52,7 +52,7 @@ def collect_self_play_games(replay_buffer, env, net, gamma = 0.99,num_episodes =
             G = r + gamma * G
             replay_buffer.add((s, pi, actions, G))
 
-#Same function as in MCTSPlanner
+#Same function as in MCTSPlanner, still quick check why to use this
 def log_prob_diag_gaussian(mu: np.ndarray, log_std: np.ndarray, a: np.ndarray) -> float:
     # log N(a; mu, std) summed over dims
     std = np.exp(log_std)
