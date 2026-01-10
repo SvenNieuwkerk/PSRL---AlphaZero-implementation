@@ -511,6 +511,7 @@ class MCTSPlanner:
         Often equals reward, but you may want to clamp or map to +/-1, etc.
         """
         return float(reward)
+        #Note Sven: I don't think we ever want to clamp it to +-1. That is mainly for zero-sum two player games, that is not what we have now
 
     def _policy_value(self, obs_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         """
@@ -531,6 +532,8 @@ class MCTSPlanner:
     def _sample_action(self, mu: np.ndarray, log_std: np.ndarray) -> np.ndarray:
         std = np.exp(log_std)
         a = mu + std * self.rng.standard_normal(size=mu.shape)
+        #Note Sven: This is already our action constricted stuff. We have the set somewhere right?
+        # Maybe make the sampling a separate function from the action constricting. Could then try different options like distribution masking?
         return np.clip(a, -1.0, 1.0) # if your env expects actions clipped to [-1, 1]
     
     def _log_prob_diag_gaussian(self, mu: np.ndarray, log_std: np.ndarray, a: np.ndarray) -> float:
