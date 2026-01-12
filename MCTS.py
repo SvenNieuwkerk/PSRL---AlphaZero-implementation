@@ -110,6 +110,20 @@ class MCTSPlanner:
         # Action selection from root after search
         temperature: float = 1.0,
         rng: Optional[np.random.Generator] = None,
+        # --- Action proposal / ablation knobs ---
+        # Uniform warmstart:
+        K_uniform_per_node: int = 0,      # 0 disables per-node uniform warmstart
+        warmstart_iters: int = 0,         # 0 disables global warmstart (first N training iters)
+        # Novelty reject:
+        novelty_eps: float = 0.0,         # <=0 disables novelty reject
+        novelty_metric: str = "linf",     # "linf" or "l2"
+        # Diversity scoring:
+        num_candidates: int = 1,          # <=1 disables candidate pool scoring behavior
+        diversity_lambda: float = 0.0,    # <=0 disables diversity term
+        diversity_sigma: float = 0.25,    # kernel width for diversity penalty
+        policy_beta: float = 1.0,         # weight on log-prob term in scoring
+        # Resampling attempts for finding a novel action:
+        max_resample_attempts: int = 8,
     ):
         self.net = net
         self.device = device
@@ -131,7 +145,29 @@ class MCTSPlanner:
         self.temperature = temperature
         self.rng = rng if rng is not None else np.random.default_rng()
 
+        # --- Action proposal / ablation knobs ---
+        self.K_uniform_per_node = int(K_uniform_per_node)
+        self.warmstart_iters = int(warmstart_iters)
+
+        self.novelty_eps = float(novelty_eps)
+        self.novelty_metric = str(novelty_metric)
+
+        self.num_candidates = int(num_candidates)
+        self.diversity_lambda = float(diversity_lambda)
+        self.diversity_sigma = float(diversity_sigma)
+        self.policy_beta = float(policy_beta)
+
+        self.max_resample_attempts = int(max_resample_attempts)
+
+        # Global training iteration index (set from notebook each outer loop)
+        self.training_iter: int = 0
+
     # -------- Public API --------
+    
+    
+    def set_training_iter(self, it: int) -> None:
+        self.training_iter = int(it)
+
 
     def search(self, root_state: State) -> "MCTSNode":
         """
@@ -276,6 +312,7 @@ class MCTSPlanner:
         path: list[tuple["MCTSNode", "Child"]] = []
         depth = 0
 
+
         while True:
             # --- Case 1: terminal node ---
             if node.is_terminal:
@@ -294,16 +331,34 @@ class MCTSPlanner:
 
             # --- Case 4: expansion allowed (progressive widening) ---
             if not self.is_fully_expanded(node):
-                edge, reward, done = self.expand_child(node)
-                path.append((node, edge))
+                out = self.expand_child(node)
 
-                if done:
-                    leaf_value = float(edge.child_node.terminal_value)
-                else:
-                    # Evaluate the newly created leaf
-                    leaf_value = float(self.evaluate_node(edge.child_node))
+                if out is not None:
+                    edge, reward, done = out
+                    path.append((node, edge))
 
+                    if done:
+                        leaf_value = float(edge.child_node.terminal_value)
+                    else:
+                        leaf_value = float(self.evaluate_node(edge.child_node))
+
+                    break
+
+                # Expansion allowed but failed to find a novel action:
+                # fall back to normal selection among existing children
+                if node.children:
+                    edge = self.select_child(node)
+                    path.append((node, edge))
+                    node = edge.child_node
+                    depth += 1
+                    continue
+
+                # If no children exist at all, something is wrong (shouldn't happen):
+                # as a safe fallback, just bootstrap from node value.
+                print("no children exist during expansion (shouldn't happen), bootstrap from node value as safe fallback")
+                leaf_value = float(node.v)
                 break
+
 
             # --- Case 5: selection among existing children (PUCT) ---
             edge = self.select_child(node)
@@ -342,49 +397,91 @@ class MCTSPlanner:
 
         return best_edge
 
-    def expand_child(self, node: "MCTSNode") -> Tuple["Child", float, bool]:
+    def expand_child(self, node: "MCTSNode") -> Optional[Tuple["Child", float, bool]]:
         """
-        Expand exactly one new child from node (sample a new continuous action).
+        Try to expand exactly one *novel* child from node (sample a new action).
 
         Returns:
         edge: the newly-added Child edge
         reward: immediate reward from stepping (s,a)->s'
         done: whether next state is terminal
+            (edge, reward, done) if a new child was added
+        None if expansion was allowed but we failed to propose a novel action
+            (caller should fall back to selection)
         """
         # Ensure policy/value are cached on this node
         self.evaluate_node(node)
         if node.mu is None or node.log_std is None:
             raise AssertionError("Node policy params not cached.")
 
-        # 1) Sample a new action from the node's Gaussian policy
-        action = self._sample_action(node.mu, node.log_std)  # np.ndarray, shape (action_dim,)
+        mu = node.mu.astype(np.float64)
+        log_std = node.log_std.astype(np.float64)
+        action_dim = mu.shape[0]
 
-        # 2) Compute raw prior weight from policy density at that action
-        prior_raw = self._prior_weight(node.mu, node.log_std, action)
+        A_existing = self._existing_actions(node)
 
-        # 3) Transition
-        next_state, reward, done, info = self.step_fn(node.state, action)
-        reward = float(reward)
-        done = bool(done)
+        use_uniform = self._use_uniform_warmstart(node)
 
-        # 4) Add child edge/node (stores reward on edge + stores P_raw)
-        child_node = node.add_child(
-            action=action,
-            child_state=next_state,
-            prior_raw=prior_raw,
-            reward=reward,
-        )
-        edge = node.children[-1]
+        # Try multiple times to find something novel
+        attempts = max(1, self.max_resample_attempts)
+        for _ in range(attempts):
+            # --- build candidate pool ---
+            M = max(1, self.num_candidates)
 
-        # 5) Mark terminal if done
-        if done:
-            child_node.is_terminal = True
-            child_node.terminal_value = float(self.terminal_mapping(reward, info))
+            candidates: list[np.ndarray] = []
+            for _k in range(M):
+                if use_uniform:
+                    a = self._sample_uniform_action(action_dim)
+                else:
+                    a = self._sample_action(mu, log_std).astype(np.float64)  # already clipped in your implementation
 
-        # 6) Normalize priors at THIS node (recommended for every node, not only root)
-        self.normalize_node_priors(node)
+                # ensure bounds (uniform already in bounds; gaussian already clipped)
+                a = np.clip(a, -1.0, 1.0)
+                candidates.append(a)
 
-        return edge, reward, done
+            # --- if diversity scoring is enabled, choose best candidate by score ---
+            if self.diversity_lambda > 0.0 and M > 1:
+                scored = [(self._candidate_score(mu, log_std, a, A_existing), a) for a in candidates]
+                scored.sort(key=lambda x: x[0], reverse=True)
+                a_star = scored[0][1]
+            else:
+                # no diversity scoring: just take the first candidate
+                a_star = candidates[0]
+
+            # --- novelty reject (hard) ---
+            if not self._is_novel(a_star, A_existing):
+                # try again
+                continue
+
+            # Compute prior (from policy density, regardless of how we sampled)
+            prior_raw = self._prior_weight(mu, log_std, a_star)
+
+            # Transition
+            next_state, reward, done, info = self.step_fn(node.state, a_star)
+            reward = float(reward)
+            done = bool(done)
+
+            # Add child
+            child_node = node.add_child(
+                action=a_star.astype(np.float32),
+                child_state=next_state,
+                prior_raw=prior_raw,
+                reward=reward,
+            )
+            edge = node.children[-1]
+
+            # Terminal bookkeeping
+            if done:
+                child_node.is_terminal = True
+                child_node.terminal_value = float(self.terminal_mapping(reward, info))
+
+            # Normalize priors at node
+            self.normalize_node_priors(node)
+
+            return edge, reward, done
+
+        # If we get here, expansion was allowed but we couldn't find a novel action
+        return None
 
 
     def evaluate_node(self, node: "MCTSNode") -> float:
@@ -546,3 +643,59 @@ class MCTSPlanner:
 
     def _prior_weight(self, mu: np.ndarray, log_std: np.ndarray, a: np.ndarray) -> float:
         return float(np.exp(self._log_prob_diag_gaussian(mu, log_std, a)))
+    
+    def _existing_actions(self, node: "MCTSNode") -> np.ndarray:
+        if not node.children:
+            return np.empty((0, 0), dtype=np.float64)
+        A = np.stack([ch.action for ch in node.children], axis=0).astype(np.float64)
+        return A
+    
+    def _min_action_distance(self, a: np.ndarray, A: np.ndarray) -> float:
+        if A.size == 0:
+            return float("inf")
+
+        if self.novelty_metric == "l2":
+            d = np.linalg.norm(A - a[None, :], axis=1)
+            return float(np.min(d))
+
+        # default: L-infinity (max abs dim diff)
+        d = np.max(np.abs(A - a[None, :]), axis=1)
+        return float(np.min(d))
+
+    def _is_novel(self, a: np.ndarray, A: np.ndarray) -> bool:
+        if self.novelty_eps <= 0.0 or A.size == 0:
+            return True
+        return self._min_action_distance(a, A) >= self.novelty_eps
+    
+    def _sample_uniform_action(self, action_dim: int) -> np.ndarray:
+        return self.rng.uniform(-1.0, 1.0, size=(action_dim,)).astype(np.float64)
+    
+    def _diversity_penalty(self, a: np.ndarray, A: np.ndarray) -> float:
+        """
+        Larger when `a` is close to existing actions.
+        Using an RBF-style repulsion.
+        """
+        if self.diversity_lambda <= 0.0 or A.size == 0:
+            return 0.0
+
+        sigma = max(self.diversity_sigma, 1e-8)
+        diff = A - a[None, :]
+        d2 = np.sum(diff * diff, axis=1)
+        penalty = float(np.sum(np.exp(-d2 / (2.0 * sigma * sigma))))
+        return penalty
+    
+    def _candidate_score(self, mu: np.ndarray, log_std: np.ndarray, a: np.ndarray, A_existing: np.ndarray) -> float:
+        """
+        score(a) = beta * log_pi(a|s) - lambda * diversity_penalty(a)
+        """
+        logp = self._log_prob_diag_gaussian(mu, log_std, a)
+        div = self._diversity_penalty(a, A_existing)
+        return float(self.policy_beta * logp - self.diversity_lambda * div)
+
+    def _use_uniform_warmstart(self, node: "MCTSNode") -> bool:
+        if self.warmstart_iters > 0 and self.training_iter < self.warmstart_iters:
+            return True
+        if self.K_uniform_per_node > 0 and len(node.children) < self.K_uniform_per_node:
+            return True
+        return False
+    
