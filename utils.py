@@ -446,7 +446,6 @@ def train_step_mcts_distill(
         "loss_total": float(total.item()),
         "loss_value": float(value_loss.item()),
         "loss_policy_distill": float(imitation_loss.item()),
-        "value_target": 0.0 if value_target == "mcts" else 1.0,  # handy flag for debugging
     }
 
 
