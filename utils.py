@@ -566,8 +566,13 @@ def run_eval_episodes(
     successes = 0
     collisions = 0
 
+    plot_data = []
+
     for seed in seeds:
+        plot_dict = {}
         obs, info = env_eval.reset(seed=int(seed))
+        plot_dict.setdefault("states", []).append(obs)
+
         ep_return = 0.0
         ep_len = 0
         done = False
@@ -579,6 +584,8 @@ def run_eval_episodes(
             action = planner.act(root, training=False)  # greedy
 
             obs, reward, terminated, truncated, info = env_eval.step(action)
+            plot_dict.setdefault("states", []).append(obs)
+
             done = bool(terminated or truncated)
 
             ep_return += float(reward)
@@ -590,6 +597,7 @@ def run_eval_episodes(
 
         returns.append(ep_return)
         lengths.append(ep_len)
+        plot_data.append(plot_dict)
 
         if terminal_reward is not None:
             if np.isclose(terminal_reward, goal_reward):
@@ -604,4 +612,7 @@ def run_eval_episodes(
         "eval_length_mean": float(np.mean(lengths)) if n else 0.0,
         "success_rate": float(successes) / float(n) if n else 0.0,
         "collision_rate": float(collisions) / float(n) if n else 0.0,
+        "returns": returns,
+        "lengths": lengths,
+        "plot_data": plot_data
     }
