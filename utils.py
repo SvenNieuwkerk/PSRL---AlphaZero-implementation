@@ -369,7 +369,8 @@ def train_step_mle(
     # Value regression to MCTS target
     loss_value = F.mse_loss(v, z_mcts)
 
-    total = w_policy * loss_policy + w_value * loss_value
+    total = loss_policy + (loss_policy.detach() / (loss_value.detach() + 1e-8)) * loss_value
+    #total = loss_policy + loss_value
 
     optimizer.zero_grad(set_to_none=True)
     total.backward()
