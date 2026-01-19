@@ -215,6 +215,8 @@ def collect_one_episode_hybrid(
     gamma: float,
     training: bool = True,
     store_debug_root_every: int = 0,
+    goal_reward: float = 100.0,
+    collision_reward: float = -100.0
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     Collect a single episode using:
@@ -305,13 +307,26 @@ def collect_one_episode_hybrid(
         if done:
             break
 
+    reward = episode[-1]["reward"]
+    success = False
+    collision = False
+    max_steps_reached = False
+    if np.isclose(reward, goal_reward):
+        success = True
+    elif np.isclose(reward, collision_reward):
+        collision = True
+    elif ep_len == max_steps:
+        max_steps_reached = True
+
     # 6) Compute Monte-Carlo returns (return-to-go) backwards
     G = 0.0
-    z_mc_list = [0.0] * len(episode)
+    #z_mc_list = [0.0] * len(episode)
     for i in range(len(episode) - 1, -1, -1):
         r = episode[i]["reward"]
         G = r + gamma * G
-        z_mc_list[i] = float(G)
+        episode[i]["z_mc"] = float(G)
+        #z_mc_list[i] = float(G)
+
 
     # 7) Add to replay buffer with both z targets
     for i, step in enumerate(episode):
@@ -320,7 +335,8 @@ def collect_one_episode_hybrid(
             step["mu_star"],
             step["log_std_star"],
             step["z_mcts"],
-            z_mc_list[i],
+            step["z_mc"],
+            #z_mc_list[i],
             step["actions"],
             step["probs"],
         )
@@ -331,8 +347,11 @@ def collect_one_episode_hybrid(
         "done": bool(done),
         "terminated": bool(terminated_flag),
         "truncated": bool(truncated_flag),
+        "success": success,
+        "collision": collision,
+        "max_steps_reached": max_steps_reached,
     }
-    return stats, debug_roots
+    return stats, episode
 
 
 def diag_gaussian_log_prob(mu: torch.Tensor, log_std: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -595,12 +614,12 @@ def run_eval_episodes(
       success   if terminal reward == goal_reward
       collision if terminal reward == collision_reward
     """
-    returns = []
-    lengths = []
-    successes = 0
-    collisions = 0
+    returns = np.zeros(len(seeds))
+    lengths = np.zeros(len(seeds))
+    successes =  np.zeros(len(seeds), dtype=bool)
+    collisions =  np.zeros(len(seeds), dtype=bool)
 
-    for seed in seeds:
+    for i, seed in enumerate(seeds):
         obs, info = env_eval.reset(seed=int(seed))
         ep_return = 0.0
         ep_len = 0
@@ -622,23 +641,32 @@ def run_eval_episodes(
                 terminal_reward = float(reward)
                 break
 
-        returns.append(ep_return)
-        lengths.append(ep_len)
+        returns[i] = ep_return
+        lengths[i] = ep_len
 
         if terminal_reward is not None:
             if np.isclose(terminal_reward, goal_reward):
-                successes += 1
+                successes[i] = True
             elif np.isclose(terminal_reward, collision_reward):
-                collisions += 1
+                collisions[i] = True
 
     n = len(seeds)
-    print(f"Returns: {returns}")
-    print(f"Lengths: {lengths}")
-    print(f"Successes: {successes}")
+    #print(f"Returns: {returns}")
+    #print(f"Lengths: {lengths}")
+    #print(f"Successes: {successes}")
+    #max_steps = lengths==max_steps
+    #print(f"Max staps via length equal to max steps: {max_steps}")
+    max_steps = np.logical_not(np.logical_or(successes, collisions))
+    #print(f"Max steps via successes and collisions: {max_steps}")
+    #print(f"Length succesfull runs: {lengths[successes]}")
+    #print(f"Length unsuccesfull runs: {lengths[collisions]}")
     return {
         "eval_return_mean": float(np.mean(returns)) if n else 0.0,
         "eval_return_std": float(np.std(returns)) if n else 0.0,
         "eval_length_mean": float(np.mean(lengths)) if n else 0.0,
-        "success_rate": float(successes) / float(n) if n else 0.0,
-        "collision_rate": float(collisions) / float(n) if n else 0.0,
+        "success_rate": np.sum(successes) / float(n) if n else 0.0,
+        "collision_rate": np.sum(collisions) / float(n) if n else 0.0,
+        "max_step_rate": np.sum(max_steps) / float(n) if n else 0.0,
+        "eval_length_mean_successes":  float(np.mean(lengths[successes])) if np.sum(successes)>0 else 0.0,
+        "eval_length_mean_collisions": float(np.mean(lengths[collisions])) if np.sum(collisions) > 0 else 0.0,
     }
