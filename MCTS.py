@@ -607,7 +607,7 @@ class MCTSPlanner:
         Map environment reward/info into terminal value used for backup.
         Often equals reward, but you may want to clamp or map to +/-1, etc.
         """
-        return float(reward)
+        return 0.0 #float(reward) #might cause a bug with double counting in backup()
         #Note Sven: I don't think we ever want to clamp it to +-1. That is mainly for zero-sum two player games, that is not what we have now
 
     def _policy_value(self, obs_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
