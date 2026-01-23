@@ -1,5 +1,9 @@
-# Ignore the debug traces folder anywhere in the repo
-debug_traces/
+# Ignore debug traces folder anywhere
+**/debug_traces/
 
+# Python cache
 __pycache__/
 *.pyc
+
+# Jupyter autosaves
+.ipynb_checkpoints/
