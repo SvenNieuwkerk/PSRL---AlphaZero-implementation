@@ -175,37 +175,6 @@ class ReplayBufferHybrid:
 
         return obs_t, mu_star_t, log_std_star_t, z_mcts_t, z_mc_t, actions_t, probs_t, mask_t
 
-class RunningMeanStd:
-    def __init__(self, eps=1e-6, device="cpu"):
-        self.mean = torch.zeros(1, device=device)
-        self.var = torch.ones(1, device=device)
-        self.count = eps
-
-    @torch.no_grad()
-    def update(self, x: torch.Tensor):
-        x = x.detach()
-        batch_mean = x.mean()
-        batch_var = x.var(unbiased=False)
-        batch_count = x.numel()
-
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_count
-
-        new_mean = self.mean + delta * batch_count / total_count
-
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
-        new_var = M2 / total_count
-
-        self.mean = new_mean
-        self.var = new_var
-        self.count = total_count
-
-    @property
-    def std(self):
-        return torch.sqrt(self.var + 1e-8)
-
 def collect_one_episode_hybrid(
     *,
     env_real,
@@ -470,10 +439,7 @@ def train_step_mcts_distill(
     else:
         raise ValueError(f"value_target must be 'mc' or 'mcts', got {value_target}")
 
-    value_rms.update(z)
-    z_norm = (z - value_rms.mean) / value_rms.std
-
-    value_loss = F.smooth_l1_loss(v, z_norm)
+    value_loss = F.smooth_l1_loss(v, z)
     #value_loss = F.mse_loss(v, z)
 
     # --- Policy distillation loss ---
