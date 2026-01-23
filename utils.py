@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import math
 import torch.nn.functional as F
+from pprint import pprint
+
 
 
 LOG_2PI = math.log(2.0 * math.pi)
@@ -186,6 +188,7 @@ def collect_one_episode_hybrid(
     gamma: float,
     training: bool = True,
     store_debug_root_every: int = 0,
+    obs = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     Collect a single episode using:
@@ -206,12 +209,17 @@ def collect_one_episode_hybrid(
       stats: episode stats
       debug_roots: optional snapshots of root children (heavy) if store_debug_root_every > 0
     """
-    obs, info = env_real.reset()
+    if obs is None: # new collection, else debug collection with fixed obs
+        obs, info = env_real.reset()
+
+    else:
+        print("DEBUG: COLLECTION RUN WITH OBS:", obs)
+        env_set_state(env_real, obs)
 
     episode = []  # list of dicts, one per step (stores everything except z_mc until end)
     rewards = []
 
-    debug_roots: List[Dict[str, Any]] = []
+    debug_roots = []
 
     ep_return = 0.0
     ep_len = 0
@@ -222,22 +230,8 @@ def collect_one_episode_hybrid(
     for t in range(max_steps):
         # 1) Search from current observation
         root = planner.search(obs)
-
-        # Optional debug snapshot
-        if store_debug_root_every and (t % store_debug_root_every == 0):
-            debug_roots.append({
-                "t": t,
-                "state": obs.copy(),
-                "children": [
-                    {
-                        "action": ch.action.copy(),
-                        "N_sa": int(ch.N_sa),
-                        "Q_sa": float(ch.Q_sa),
-                        "P_sa": float(getattr(ch, "P_sa", 0.0)),
-                    }
-                    for ch in root.children
-                ],
-            })
+        # roots for debugging
+        debug_roots.append(root)
 
         # 2) Get discrete MCTS policy over sampled actions
         probs, actions = planner.policy_from_root(root)  # probs: (K,), actions: (K, action_dim)
@@ -617,3 +611,79 @@ def run_eval_episodes(
         "lengths": lengths,
         "plot_data": plot_data
     }
+
+def run_debug_eval_episode(
+    *,
+    env_eval,
+    planner,
+    seed: int,
+    max_steps: int,
+    obs = None,
+)-> Dict[str, Any]:
+    
+    if obs is None: # new collection, else debug collection with fixed obs
+        obs, info = env_eval.reset(seed=int(seed))
+
+    else:
+        print("DEBUG: EVAL DEBUG EPISODE RUN WITH OBS:", obs)
+        info = None
+        env_set_state(env_eval, obs)
+
+    states = [obs]
+    roots = []
+    chosen_idx = []
+    actions_taken = []
+    network_outputs = []
+    targets_from_root = []
+
+    for t in range(int(max_steps)):
+        root = planner.search(obs)
+        action = planner.act(root, training=False)
+        mu, log_std, v = planner._policy_value(obs)
+        mu_star, log_std_star, v_star = planner.targets_from_root(root)
+        obs, reward, terminated, truncated, info = env_eval.step(action)
+
+
+
+        roots.append(root)
+        actions_taken.append(action)
+        states.append(obs)
+        network_outputs.append((mu, log_std, v))
+        targets_from_root.append((mu_star, log_std_star, v_star))
+        
+        # chosen child index
+        idx = int(np.argmin([np.max(np.abs(ch.action - action)) for ch in root.children]))
+            # calculates nearest child-action to actual taken action, returns index of that
+        chosen_idx.append(idx)
+        
+        if terminated or truncated:
+            break
+
+    return {
+        "seed": seed,
+        "info": info,
+        "states": states,
+        "roots": roots,
+        "chosen_idx": chosen_idx,
+        "actions": actions_taken,
+        "network_outputs": network_outputs,
+        "targets_from_root": targets_from_root
+    }
+
+def env_set_state(env, obs) -> None:
+    """
+    Overwrite env internal state to match the flat observation vector.
+
+    obs layout:
+      [agent_x, agent_y, goal_x, goal_y, (obs_x, obs_y, obs_r)*N]
+    """
+    obs = np.asarray(obs, dtype=env._dtype)
+
+    # agent and goal
+    env._agent_position = obs[0:2].copy()
+    env._goal_position = obs[2:4].copy()
+
+    # obstacles
+    obstacles = obs[4:].reshape(-1, 3)
+    env._obstacle_position = obstacles[:, 0:2].copy()
+    env._obstacle_radius = obstacles[:, 2].copy()
