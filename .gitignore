@@ -1,2 +1,5 @@
 # Ignore the debug traces folder anywhere in the repo
 debug_traces/
+
+__pycache__/
+*.pyc

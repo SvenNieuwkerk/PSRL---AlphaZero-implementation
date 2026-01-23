@@ -5,8 +5,6 @@ import numpy as np
 import torch
 import math
 import torch.nn.functional as F
-from pprint import pprint
-
 
 
 LOG_2PI = math.log(2.0 * math.pi)
@@ -177,6 +175,8 @@ class ReplayBufferHybrid:
 
         return obs_t, mu_star_t, log_std_star_t, z_mcts_t, z_mc_t, actions_t, probs_t, mask_t
 
+
+
 def collect_one_episode_hybrid(
     *,
     env_real,
@@ -186,9 +186,6 @@ def collect_one_episode_hybrid(
     gamma: float,
     training: bool = True,
     store_debug_root_every: int = 0,
-    obs = None,
-    goal_reward: float = 100.0,
-    collision_reward: float = -100.0
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     Collect a single episode using:
@@ -209,17 +206,12 @@ def collect_one_episode_hybrid(
       stats: episode stats
       debug_roots: optional snapshots of root children (heavy) if store_debug_root_every > 0
     """
-    if obs is None: # new collection, else debug collection with fixed obs
-        obs, info = env_real.reset()
-
-    else:
-        print("DEBUG: COLLECTION RUN WITH OBS:", obs)
-        env_set_state(env_real, obs)
+    obs, info = env_real.reset()
 
     episode = []  # list of dicts, one per step (stores everything except z_mc until end)
     rewards = []
 
-    debug_roots = []
+    debug_roots: List[Dict[str, Any]] = []
 
     ep_return = 0.0
     ep_len = 0
@@ -230,8 +222,22 @@ def collect_one_episode_hybrid(
     for t in range(max_steps):
         # 1) Search from current observation
         root = planner.search(obs)
-        # roots for debugging
-        debug_roots.append(root)
+
+        # Optional debug snapshot
+        if store_debug_root_every and (t % store_debug_root_every == 0):
+            debug_roots.append({
+                "t": t,
+                "state": obs.copy(),
+                "children": [
+                    {
+                        "action": ch.action.copy(),
+                        "N_sa": int(ch.N_sa),
+                        "Q_sa": float(ch.Q_sa),
+                        "P_sa": float(getattr(ch, "P_sa", 0.0)),
+                    }
+                    for ch in root.children
+                ],
+            })
 
         # 2) Get discrete MCTS policy over sampled actions
         probs, actions = planner.policy_from_root(root)  # probs: (K,), actions: (K, action_dim)
@@ -270,26 +276,13 @@ def collect_one_episode_hybrid(
         if done:
             break
 
-    reward = episode[-1]["reward"]
-    success = False
-    collision = False
-    max_steps_reached = False
-    if np.isclose(reward, goal_reward):
-        success = True
-    elif np.isclose(reward, collision_reward):
-        collision = True
-    elif ep_len == max_steps:
-        max_steps_reached = True
-
     # 6) Compute Monte-Carlo returns (return-to-go) backwards
     G = 0.0
-    #z_mc_list = [0.0] * len(episode)
+    z_mc_list = [0.0] * len(episode)
     for i in range(len(episode) - 1, -1, -1):
         r = episode[i]["reward"]
         G = r + gamma * G
-        episode[i]["z_mc"] = float(G)
-        #z_mc_list[i] = float(G)
-
+        z_mc_list[i] = float(G)
 
     # 7) Add to replay buffer with both z targets
     for i, step in enumerate(episode):
@@ -298,8 +291,7 @@ def collect_one_episode_hybrid(
             step["mu_star"],
             step["log_std_star"],
             step["z_mcts"],
-            step["z_mc"],
-            #z_mc_list[i],
+            z_mc_list[i],
             step["actions"],
             step["probs"],
         )
@@ -310,11 +302,8 @@ def collect_one_episode_hybrid(
         "done": bool(done),
         "terminated": bool(terminated_flag),
         "truncated": bool(truncated_flag),
-        "success": success,
-        "collision": collision,
-        "max_steps_reached": max_steps_reached,
     }
-    return stats, episode
+    return stats, debug_roots
 
 
 def diag_gaussian_log_prob(mu: torch.Tensor, log_std: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -380,8 +369,7 @@ def train_step_mle(
     # Value regression to MCTS target
     loss_value = F.mse_loss(v, z_mcts)
 
-    total = loss_policy + (loss_policy.detach() / (loss_value.detach() + 1e-8)) * loss_value
-    #total = loss_policy + loss_value
+    total = w_policy * loss_policy + w_value * loss_value
 
     optimizer.zero_grad(set_to_none=True)
     total.backward()
@@ -403,7 +391,6 @@ def train_step_mcts_distill(
     net,
     optimizer,
     batch: Tuple[torch.Tensor, ...],
-    value_rms,
     value_target: str = "mc",   # "mc" (your teammate) or "mcts"
     w_value: float = 1.0,
     w_policy: float = 1.0,
@@ -434,8 +421,7 @@ def train_step_mcts_distill(
     else:
         raise ValueError(f"value_target must be 'mc' or 'mcts', got {value_target}")
 
-    value_loss = F.smooth_l1_loss(v, z)
-    #value_loss = F.mse_loss(v, z)
+    value_loss = F.mse_loss(v, z)
 
     # --- Policy distillation loss ---
     logp = diag_gaussian_log_prob(mu, log_std, actions)  # (B, K)
@@ -575,18 +561,13 @@ def run_eval_episodes(
       success   if terminal reward == goal_reward
       collision if terminal reward == collision_reward
     """
-    returns = np.zeros(len(seeds))
-    lengths = np.zeros(len(seeds))
-    successes =  np.zeros(len(seeds), dtype=bool)
-    collisions =  np.zeros(len(seeds), dtype=bool)
+    returns = []
+    lengths = []
+    successes = 0
+    collisions = 0
 
-    plot_data = []
-
-    for i, seed in enumerate(seeds):
-        plot_dict = {}
+    for seed in seeds:
         obs, info = env_eval.reset(seed=int(seed))
-        plot_dict.setdefault("states", []).append(obs)
-
         ep_return = 0.0
         ep_len = 0
         done = False
@@ -598,8 +579,6 @@ def run_eval_episodes(
             action = planner.act(root, training=False)  # greedy
 
             obs, reward, terminated, truncated, info = env_eval.step(action)
-            plot_dict.setdefault("states", []).append(obs)
-
             done = bool(terminated or truncated)
 
             ep_return += float(reward)
@@ -609,112 +588,20 @@ def run_eval_episodes(
                 terminal_reward = float(reward)
                 break
 
-        returns[i] = ep_return
-        lengths[i] = ep_len
-        plot_data.append(plot_dict)
+        returns.append(ep_return)
+        lengths.append(ep_len)
 
         if terminal_reward is not None:
             if np.isclose(terminal_reward, goal_reward):
-                successes[i] = True
+                successes += 1
             elif np.isclose(terminal_reward, collision_reward):
-                collisions[i] = True
+                collisions += 1
 
     n = len(seeds)
-    #print(f"Returns: {returns}")
-    #print(f"Lengths: {lengths}")
-    #print(f"Successes: {successes}")
-    #max_steps = lengths==max_steps
-    #print(f"Max staps via length equal to max steps: {max_steps}")
-    max_steps = np.logical_not(np.logical_or(successes, collisions))
-    #print(f"Max steps via successes and collisions: {max_steps}")
-    #print(f"Length succesfull runs: {lengths[successes]}")
-    #print(f"Length unsuccesfull runs: {lengths[collisions]}")
     return {
         "eval_return_mean": float(np.mean(returns)) if n else 0.0,
         "eval_return_std": float(np.std(returns)) if n else 0.0,
         "eval_length_mean": float(np.mean(lengths)) if n else 0.0,
-        "success_rate": np.sum(successes) / float(n) if n else 0.0,
-        "collision_rate": np.sum(collisions) / float(n) if n else 0.0,
-        "max_step_rate": np.sum(max_steps) / float(n) if n else 0.0,
-        "eval_length_mean_successes":  float(np.mean(lengths[successes])) if np.sum(successes)>0 else 0.0,
-        "eval_length_mean_collisions": float(np.mean(lengths[collisions])) if np.sum(collisions) > 0 else 0.0,
-        "returns": returns,
-        "lengths": lengths,
-        "plot_data": plot_data
+        "success_rate": float(successes) / float(n) if n else 0.0,
+        "collision_rate": float(collisions) / float(n) if n else 0.0,
     }
-
-def run_debug_eval_episode(
-    *,
-    env_eval,
-    planner,
-    seed: int,
-    max_steps: int,
-    obs = None,
-)-> Dict[str, Any]:
-    
-    if obs is None: # new collection, else debug collection with fixed obs
-        obs, info = env_eval.reset(seed=int(seed))
-
-    else:
-        print("DEBUG: EVAL DEBUG EPISODE RUN WITH OBS:", obs)
-        info = None
-        env_set_state(env_eval, obs)
-
-    states = [obs]
-    roots = []
-    chosen_idx = []
-    actions_taken = []
-    network_outputs = []
-    targets_from_root = []
-
-    for t in range(int(max_steps)):
-        root = planner.search(obs)
-        action = planner.act(root, training=False)
-        mu, log_std, v = planner._policy_value(obs)
-        mu_star, log_std_star, v_star = planner.targets_from_root(root)
-        obs, reward, terminated, truncated, info = env_eval.step(action)
-
-
-
-        roots.append(root)
-        actions_taken.append(action)
-        states.append(obs)
-        network_outputs.append((mu, log_std, v))
-        targets_from_root.append((mu_star, log_std_star, v_star))
-        
-        # chosen child index
-        idx = int(np.argmin([np.max(np.abs(ch.action - action)) for ch in root.children]))
-            # calculates nearest child-action to actual taken action, returns index of that
-        chosen_idx.append(idx)
-        
-        if terminated or truncated:
-            break
-
-    return {
-        "seed": seed,
-        "info": info,
-        "states": states,
-        "roots": roots,
-        "chosen_idx": chosen_idx,
-        "actions": actions_taken,
-        "network_outputs": network_outputs,
-        "targets_from_root": targets_from_root
-    }
-
-def env_set_state(env, obs) -> None:
-    """
-    Overwrite env internal state to match the flat observation vector.
-
-    obs layout:
-      [agent_x, agent_y, goal_x, goal_y, (obs_x, obs_y, obs_r)*N]
-    """
-    obs = np.asarray(obs, dtype=env._dtype)
-
-    # agent and goal
-    env._agent_position = obs[0:2].copy()
-    env._goal_position = obs[2:4].copy()
-
-    # obstacles
-    obstacles = obs[4:].reshape(-1, 3)
-    env._obstacle_position = obstacles[:, 0:2].copy()
-    env._obstacle_radius = obstacles[:, 2].copy()
