@@ -557,6 +557,9 @@ def topk_from_policy(probs: np.ndarray, actions: np.ndarray, K_max: int):
 
     return probs_top, actions_top
 
+from typing import Any, Dict, Optional, Sequence, Tuple
+import numpy as np
+
 def run_eval_episodes(
     *,
     env_eval,
@@ -565,53 +568,71 @@ def run_eval_episodes(
     max_steps: int,
     goal_reward: float = 100.0,
     collision_reward: float = -100.0,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
     """
-    Deterministic evaluation on a fixed seed set (RL 'validation').
+    Eval over multiple seeds.
 
-    Runs one episode per seed with greedy action selection (training=False).
-
-    Success/collision are inferred from terminal rewards:
-      success   if terminal reward == goal_reward
-      collision if terminal reward == collision_reward
+    Returns:
+      stats: aggregate metrics (like your old function, but WITHOUT plot_data)
+      traces: dict mapping seed -> per-episode trace dict (dbg-like), containing:
+        seed, info, states, roots, chosen_idx, actions, network_outputs, targets_from_root
     """
     returns = np.zeros(len(seeds))
     lengths = np.zeros(len(seeds))
-    successes =  np.zeros(len(seeds), dtype=bool)
-    collisions =  np.zeros(len(seeds), dtype=bool)
+    successes = np.zeros(len(seeds), dtype=bool)
+    collisions = np.zeros(len(seeds), dtype=bool)
 
-    plot_data = []
+    traces: Dict[int, Dict[str, Any]] = {}
 
     for i, seed in enumerate(seeds):
-        plot_dict = {}
         obs, info = env_eval.reset(seed=int(seed))
-        plot_dict.setdefault("states", []).append(obs)
+
+        trace = {
+            "seed": int(seed),
+            "info": info,
+            "states": [obs],
+            "roots": [],
+            "chosen_idx": [],
+            "actions": [],
+            "network_outputs": [],
+            "targets_from_root": [],
+        }
 
         ep_return = 0.0
         ep_len = 0
-        done = False
-
         terminal_reward: Optional[float] = None
 
         for _t in range(int(max_steps)):
             root = planner.search(obs)
-            action = planner.act(root, training=False)  # greedy
+            action = planner.act(root, training=False)
+
+            mu, log_std, v = planner._policy_value(obs)
+            mu_star, log_std_star, v_star = planner.targets_from_root(root)
+
+            if len(root.children) > 0:
+                idx = int(np.argmin([np.max(np.abs(ch.action - action)) for ch in root.children]))
+            else:
+                idx = -1
+
+            trace["roots"].append(root)
+            trace["chosen_idx"].append(idx)
+            trace["actions"].append(action)
+            trace["network_outputs"].append((mu, log_std, v))
+            trace["targets_from_root"].append((mu_star, log_std_star, v_star))
 
             obs, reward, terminated, truncated, info = env_eval.step(action)
-            plot_dict.setdefault("states", []).append(obs)
-
-            done = bool(terminated or truncated)
+            trace["states"].append(obs)
 
             ep_return += float(reward)
             ep_len += 1
 
-            if done:
+            if terminated or truncated:
                 terminal_reward = float(reward)
                 break
 
         returns[i] = ep_return
         lengths[i] = ep_len
-        plot_data.append(plot_dict)
+        traces[int(seed)] = trace
 
         if terminal_reward is not None:
             if np.isclose(terminal_reward, goal_reward):
@@ -620,28 +641,25 @@ def run_eval_episodes(
                 collisions[i] = True
 
     n = len(seeds)
-    #print(f"Returns: {returns}")
-    #print(f"Lengths: {lengths}")
-    #print(f"Successes: {successes}")
-    #max_steps = lengths==max_steps
-    #print(f"Max staps via length equal to max steps: {max_steps}")
-    max_steps = np.logical_not(np.logical_or(successes, collisions))
-    #print(f"Max steps via successes and collisions: {max_steps}")
-    #print(f"Length succesfull runs: {lengths[successes]}")
-    #print(f"Length unsuccesfull runs: {lengths[collisions]}")
-    return {
+    max_steps_mask = np.logical_not(np.logical_or(successes, collisions))
+
+    stats = {
         "eval_return_mean": float(np.mean(returns)) if n else 0.0,
         "eval_return_std": float(np.std(returns)) if n else 0.0,
         "eval_length_mean": float(np.mean(lengths)) if n else 0.0,
         "success_rate": np.sum(successes) / float(n) if n else 0.0,
         "collision_rate": np.sum(collisions) / float(n) if n else 0.0,
-        "max_step_rate": np.sum(max_steps) / float(n) if n else 0.0,
-        "eval_length_mean_successes":  float(np.mean(lengths[successes])) if np.sum(successes)>0 else 0.0,
+        "max_step_rate": np.sum(max_steps_mask) / float(n) if n else 0.0,
+        "eval_length_mean_successes": float(np.mean(lengths[successes])) if np.sum(successes) > 0 else 0.0,
         "eval_length_mean_collisions": float(np.mean(lengths[collisions])) if np.sum(collisions) > 0 else 0.0,
         "returns": returns,
         "lengths": lengths,
-        "plot_data": plot_data
+        "successes": successes,
+        "collisions": collisions,
     }
+
+    return stats, traces
+
 
 def run_debug_eval_episode(
     *,
