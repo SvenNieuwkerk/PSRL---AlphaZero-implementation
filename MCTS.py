@@ -19,7 +19,7 @@ Action = NDArray[np.generic]
 PolicyParams = Any
 
 # step_fn returns next_state, reward, done, and optionally info
-StepFn = Callable[[State, Action], Tuple[State, float, bool, Dict[str, Any]]]
+StepFn = Callable[["MCTSNode", Action], Tuple[State, bool, float, bool, Dict[str, Any]]]
 
 
 @dataclass
@@ -38,6 +38,7 @@ class MCTSNode:
     state: State
     parent: Optional[MCTSNode] = None
     parent_action: Optional[np.ndarray] = None
+    coin_collected: Optional[bool] = None
 
     N: int = 0
     children: List[Child] = field(default_factory=list)
@@ -64,7 +65,11 @@ class MCTSNode:
         prior_raw: float,
         reward: float,
     ) -> "MCTSNode":
-        child_node = MCTSNode(state=child_state, parent=self, parent_action=action)
+        child_node = MCTSNode(
+            state=np.array(child_state, copy=True),
+            parent=self,
+            parent_action=action,
+            coin_collected=self.coin_collected)
 
         prior_raw = float(prior_raw)
         reward = float(reward)
@@ -169,7 +174,7 @@ class MCTSPlanner:
         self.training_iter = int(it)
 
 
-    def search(self, root_state: State) -> "MCTSNode":
+    def search(self, root_state: State, *, coin_collected: bool = False) -> "MCTSNode":
         """
         Run MCTS from root_state and return the root node (containing edge stats as children).
 
@@ -181,7 +186,7 @@ class MCTSPlanner:
             - pick an action (act / policy_from_root)
             - extract training targets (N_sa, Q_sa, actions)
         """
-        root = MCTSNode(state=root_state)
+        root = MCTSNode(state=np.array(root_state, copy=True), coin_collected=bool(coin_collected))
 
         # Cache policy/value at root immediately (saves re-checks in first sim)
         self.evaluate_node(root)
@@ -457,7 +462,7 @@ class MCTSPlanner:
             prior_raw = self._prior_weight(mu, log_std, a_star)
 
             # Transition
-            next_state, reward, done, info = self.step_fn(node.state, a_star)
+            next_state, next_coin_collected, reward, done, info = self.step_fn(node, a_star)
             reward = float(reward)
             done = bool(done)
 
@@ -468,6 +473,7 @@ class MCTSPlanner:
                 prior_raw=prior_raw,
                 reward=reward,
             )
+            child_node.coin_collected = bool(next_coin_collected)
             edge = node.children[-1]
 
             # Terminal bookkeeping
@@ -522,6 +528,7 @@ class MCTSPlanner:
         Update rule (from leaf back to root):
             G <- r_sa + gamma * G
             parent.N += 1
+            edge.child_node.N += 1
             edge.N_sa += 1
             edge.Q_sa <- running average toward G
         """
@@ -534,6 +541,7 @@ class MCTSPlanner:
 
             # Update counts
             parent.N += 1
+            edge.child_node.N += 1
             edge.N_sa += 1
 
             # Running-average update for Q(s,a)
@@ -567,6 +575,12 @@ class MCTSPlanner:
         # Exploitation term
         q = float(edge.Q_sa)
 
+        # Normalization
+        Q_values = [child.Q_sa for child in node.children]
+        Q_min, Q_max = min(Q_values), max(Q_values)
+
+        Q_norm = (q - Q_min) / (Q_max - Q_min + 1e-8)
+
         # Exploration term
         n_s = float(node.N)
         n_sa = float(edge.N_sa)
@@ -575,7 +589,7 @@ class MCTSPlanner:
         # If node.N is 0, sqrt(0)=0 and exploration is 0. That's fine.
         u = self.cpuct * p * (math.sqrt(n_s) / (1.0 + n_sa))
 
-        return q + u
+        return Q_norm + u
 
     def normalize_node_priors(self, node: "MCTSNode") -> None:
         """

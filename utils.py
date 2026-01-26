@@ -7,6 +7,8 @@ import math
 import torch.nn.functional as F
 from pprint import pprint
 
+from plot_utils import decode_obs
+
 
 
 LOG_2PI = math.log(2.0 * math.pi)
@@ -186,7 +188,7 @@ def collect_one_episode_hybrid(
     gamma: float,
     training: bool = True,
     store_debug_root_every: int = 0,
-    obs = None,
+    node = None,
     goal_reward: float = 100.0,
     collision_reward: float = -100.0
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -209,12 +211,14 @@ def collect_one_episode_hybrid(
       stats: episode stats
       debug_roots: optional snapshots of root children (heavy) if store_debug_root_every > 0
     """
-    if obs is None: # new collection, else debug collection with fixed obs
+    if node is None: # new collection, else debug collection with fixed obs
         obs, info = env_real.reset()
+        coin = bool(getattr(env_real.unwrapped, "_coin_collected", False))
 
     else:
-        print("DEBUG: COLLECTION RUN WITH OBS:", obs)
-        env_set_state(env_real, obs)
+        print("DEBUG: COLLECTION RUN WITH root node:", node)
+        env_set_state(env_real, node, num_obstacles=env_real.unwrapped._num_obstacles)
+        coin = node.coin_collected
 
     episode = []  # list of dicts, one per step (stores everything except z_mc until end)
     rewards = []
@@ -229,7 +233,7 @@ def collect_one_episode_hybrid(
 
     for t in range(max_steps):
         # 1) Search from current observation
-        root = planner.search(obs)
+        root = planner.search(obs, coin_collected=coin)
         # roots for debugging
         debug_roots.append(root)
 
@@ -245,6 +249,7 @@ def collect_one_episode_hybrid(
 
         # 5) Step real env
         next_obs, reward, terminated, truncated, step_info = env_real.step(action)
+        coin = bool(getattr(env_real.unwrapped, "_coin_collected", False))
         done = bool(terminated or truncated)
 
         # Store step record (z_mc will be computed later)
@@ -356,6 +361,7 @@ def train_step_mle(
     net,
     optimizer,
     batch,
+    value_target: str = "mc",
     w_value: float = 1.0,
     w_policy: float = 1.0,
     grad_clip_norm: float | None = 1.0,
@@ -378,10 +384,19 @@ def train_step_mle(
     loss_policy = loss_mu + loss_log_std
 
     # Value regression to MCTS target
-    loss_value = F.mse_loss(v, z_mcts)
+    # --- Value target choice ---
+    if value_target == "mc":
+        z = z_mc
+    elif value_target == "mcts":
+        z = z_mcts
+    else:
+        raise ValueError(f"value_target must be 'mc' or 'mcts', got {value_target}")
+
+    #loss_value = F.smooth_l1_loss(v, z)
+    loss_value = F.mse_loss(v, z)
+    
 
     total = loss_policy + (loss_policy.detach() / (loss_value.detach() + 1e-8)) * loss_value
-    #total = loss_policy + loss_value
 
     optimizer.zero_grad(set_to_none=True)
     total.backward()
@@ -404,7 +419,7 @@ def train_step_mcts_distill(
     optimizer,
     batch: Tuple[torch.Tensor, ...],
     value_rms,
-    value_target: str = "mc",   # "mc" (your teammate) or "mcts"
+    value_target: str = "mc",
     w_value: float = 1.0,
     w_policy: float = 1.0,
     grad_clip_norm: Optional[float] = 1.0,
@@ -446,7 +461,14 @@ def train_step_mcts_distill(
 
     imitation_loss = -(probs_norm * logp).sum(dim=1).mean()
 
-    total = w_policy * imitation_loss + w_value * value_loss
+    # ----- Adaptive scaling of value loss -----
+    # scale value to be comparable to policy magnitude
+    value_scaled = (imitation_loss.detach() / (value_loss.detach() + 1e-8)) * value_loss
+
+
+    # ----- Total loss -----
+    #total = w_policy * imitation_loss + w_value * value_loss
+    total = imitation_loss + value_scaled
 
     optimizer.zero_grad(set_to_none=True)
     total.backward()
@@ -497,14 +519,16 @@ def train_step_hybrid(
     mu, log_std, v = net(obs)          # mu/log_std: (B,A), v: (B,1) or (B,)
     v = v.view(-1)                     # (B,)
 
-    # ----- Value target (choose one or mix) -----
+    # ----- Value loss (mix of mcts and mc rollout) -----
     # MSE per-sample
-    lv_mcts = (v - z_mcts).pow(2)
-    lv_mc = (v - z_mc).pow(2)
+    value_loss_mcts = F.smooth_l1_loss(v, z_mcts)
+    value_loss_mc = F.smooth_l1_loss(v, z_mc)
+    #value_loss_mcts = (v - z_mcts).pow(2)
+    #value_loss_mc = (v - z_mc).pow(2)
 
-    value_loss = w_value_mcts * lv_mcts.mean() + w_value_mc * lv_mc.mean()
+    value_loss = w_value_mcts * value_loss_mcts.mean() + w_value_mc * value_loss_mc.mean()
 
-    # ----- Discrete imitation loss over MCTS root actions -----
+    # ----- Policy loss - Discrete imitation loss over MCTS root actions -----
     # logp(a_i|s) for stored actions
     logp = diag_gaussian_log_prob(mu, log_std, actions)  # (B,K)
 
@@ -518,11 +542,19 @@ def train_step_hybrid(
 
     imitation_loss = -(probs_norm * logp).sum(dim=1).mean()
 
-    # ----- Gaussian regression loss (your mu*, log_std* targets) -----
+    # ----- Policy loss - Gaussian regression loss (your mu*, log_std* targets) -----
     gaussian_reg_loss = F.mse_loss(mu, mu_star) + F.mse_loss(log_std, log_std_star)
 
+    # ----- Total policy loss -----
+    policy_total = w_policy_imitation * imitation_loss + w_gaussian_reg * gaussian_reg_loss
+
+    # ----- Adaptive scaling of value loss -----
+    # scale value to be comparable to policy magnitude
+    value_scaled = (policy_total.detach() / (value_loss.detach() + 1e-8)) * value_loss
+
     # ----- Total loss -----
-    total = value_loss + w_policy_imitation * imitation_loss + w_gaussian_reg * gaussian_reg_loss
+    #total = value_loss + w_policy_imitation * imitation_loss + w_gaussian_reg * gaussian_reg_loss
+    total = policy_total + value_scaled
 
     optimizer.zero_grad(set_to_none=True)
     total.backward()
@@ -533,13 +565,15 @@ def train_step_hybrid(
     optimizer.step()
 
     return {
-        "loss_total": float(total.item()),
-        "loss_value": float(value_loss.item()),
-        "loss_value_mcts": float(lv_mcts.mean().item()),
-        "loss_value_mc": float(lv_mc.mean().item()),
-        "loss_imitation": float(imitation_loss.item()),
-        "loss_gauss_reg": float(gaussian_reg_loss.item()),
-    }
+    "loss_total": float(total.item()),
+    "loss_policy_total": float(policy_total.item()),
+    "loss_value": float(value_loss.item()),
+    "loss_value_scaled": float(value_scaled.item()),
+    "loss_value_mcts": float(value_loss_mcts.mean().item()),
+    "loss_value_mc": float(value_loss_mc.mean().item()),
+    "loss_imitation": float(imitation_loss.item()),
+    "loss_gauss_reg": float(gaussian_reg_loss.item()),
+}
 
 def topk_from_policy(probs: np.ndarray, actions: np.ndarray, K_max: int):
     probs = np.asarray(probs)
@@ -557,9 +591,6 @@ def topk_from_policy(probs: np.ndarray, actions: np.ndarray, K_max: int):
 
     return probs_top, actions_top
 
-from typing import Any, Dict, Optional, Sequence, Tuple
-import numpy as np
-
 def run_eval_episodes(
     *,
     env_eval,
@@ -568,6 +599,7 @@ def run_eval_episodes(
     max_steps: int,
     goal_reward: float = 100.0,
     collision_reward: float = -100.0,
+    gamma_mc: float = 0.99,
 ) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
     """
     Eval over multiple seeds.
@@ -586,6 +618,7 @@ def run_eval_episodes(
 
     for i, seed in enumerate(seeds):
         obs, info = env_eval.reset(seed=int(seed))
+        coin = bool(getattr(env_eval.unwrapped, "_coin_collected", False))
 
         trace = {
             "seed": int(seed),
@@ -596,6 +629,8 @@ def run_eval_episodes(
             "actions": [],
             "network_outputs": [],
             "targets_from_root": [],
+            "rewards": [],
+            "mc_return": [],
         }
 
         ep_return = 0.0
@@ -603,7 +638,7 @@ def run_eval_episodes(
         terminal_reward: Optional[float] = None
 
         for _t in range(int(max_steps)):
-            root = planner.search(obs)
+            root = planner.search(obs, coin_collected=coin)
             action = planner.act(root, training=False)
 
             mu, log_std, v = planner._policy_value(obs)
@@ -621,7 +656,9 @@ def run_eval_episodes(
             trace["targets_from_root"].append((mu_star, log_std_star, v_star))
 
             obs, reward, terminated, truncated, info = env_eval.step(action)
+            coin = bool(getattr(env_eval.unwrapped, "_coin_collected", False))
             trace["states"].append(obs)
+            trace["rewards"].append(float(reward))   # <-- add
 
             ep_return += float(reward)
             ep_len += 1
@@ -629,6 +666,15 @@ def run_eval_episodes(
             if terminated or truncated:
                 terminal_reward = float(reward)
                 break
+
+        # --- compute MC return-to-go from rewards (same logic as collect) ---
+        G = 0.0
+        mc = [0.0] * len(trace["rewards"])
+        for t in range(len(trace["rewards"]) - 1, -1, -1):
+            r = trace["rewards"][t]
+            G = r + gamma_mc * G
+            mc[t] = float(G)
+        trace["mc_return"] = mc  # len == ep_len
 
         returns[i] = ep_return
         lengths[i] = ep_len
@@ -667,16 +713,16 @@ def run_debug_eval_episode(
     planner,
     seed: int,
     max_steps: int,
-    obs = None,
+    node = None,
 )-> Dict[str, Any]:
     
-    if obs is None: # new collection, else debug collection with fixed obs
+    if node is None: # new collection, else debug collection with fixed obs
         obs, info = env_eval.reset(seed=int(seed))
 
     else:
-        print("DEBUG: EVAL DEBUG EPISODE RUN WITH OBS:", obs)
+        print("DEBUG: EVAL DEBUG EPISODE RUN WITH ROOT NODE:", node)
         info = None
-        env_set_state(env_eval, obs)
+        env_set_state(env_eval, node)
 
     states = [obs]
     roots = []
@@ -719,20 +765,75 @@ def run_debug_eval_episode(
         "targets_from_root": targets_from_root
     }
 
-def env_set_state(env, obs) -> None:
+def env_set_state(env, node, *, num_obstacles: int) -> None:
+    env = env.unwrapped
+    obs = np.asarray(node.state, dtype=env._dtype)
+
+    agent, goal, obstacles, coin, dim = decode_obs(obs, num_obstacles=num_obstacles)
+
+    env._agent_position = agent.copy()
+    env._goal_position  = goal.copy()
+    env._obstacle_position = obstacles[:, :dim].copy()
+    env._obstacle_radius   = obstacles[:, dim].copy()
+
+    # coin position if present
+    if coin is not None and hasattr(env, "_coin_position"):
+        env._coin_position = coin.copy()
+
+    # IMPORTANT: restore coin_collected memory
+    if hasattr(env, "_coin_collected"):
+        env._coin_collected = bool(node.coin_collected) if node.coin_collected is not None else False
+
+
+def grow_replay(replay: ReplayBufferHybrid, new_capacity: int, *, keep_last: int | None = None):
     """
-    Overwrite env internal state to match the flat observation vector.
+    Return a new ReplayBufferHybrid(new_capacity, ...) containing the most recent samples.
 
-    obs layout:
-      [agent_x, agent_y, goal_x, goal_y, (obs_x, obs_y, obs_r)*N]
+    Args:
+        replay: existing ReplayBufferHybrid
+        new_capacity: desired new capacity
+        keep_last: how many most-recent samples to copy (default: copy all that fit)
+
+    Notes:
+        - Keeps the newest samples (closest to replay.ptr).
+        - New buffer will be "packed" from index 0..size-1 and ptr=size.
     """
-    obs = np.asarray(obs, dtype=env._dtype)
 
-    # agent and goal
-    env._agent_position = obs[0:2].copy()
-    env._goal_position = obs[2:4].copy()
+    new_capacity = int(new_capacity)
+    if new_capacity <= 0:
+        raise ValueError("new_capacity must be > 0")
 
-    # obstacles
-    obstacles = obs[4:].reshape(-1, 3)
-    env._obstacle_position = obstacles[:, 0:2].copy()
-    env._obstacle_radius = obstacles[:, 2].copy()
+    # how many to copy
+    n_avail = int(replay.size)
+    n_copy = min(n_avail, new_capacity)
+    if keep_last is not None:
+        n_copy = min(n_copy, int(keep_last))
+
+    # compute indices of the most recent n_copy entries in the ring buffer
+    # newest written position is at ptr-1; oldest of the last n_copy is ptr-n_copy
+    start = (replay.ptr - n_copy) % replay.capacity
+    idx = (start + np.arange(n_copy)) % replay.capacity
+
+    # allocate new buffer
+    new_replay = ReplayBufferHybrid(
+        capacity=new_capacity,
+        obs_dim=replay.obs_dim,
+        action_dim=replay.action_dim,
+        K_max=replay.K_max,
+        dtype=replay.dtype,
+    )
+
+    # copy arrays into the front of the new buffer
+    new_replay.obs[:n_copy] = replay.obs[idx]
+    new_replay.mu_star[:n_copy] = replay.mu_star[idx]
+    new_replay.log_std_star[:n_copy] = replay.log_std_star[idx]
+    new_replay.z_mcts[:n_copy] = replay.z_mcts[idx]
+    new_replay.z_mc[:n_copy] = replay.z_mc[idx]
+    new_replay.actions_pad[:n_copy] = replay.actions_pad[idx]
+    new_replay.probs_pad[:n_copy] = replay.probs_pad[idx]
+    new_replay.mask[:n_copy] = replay.mask[idx]
+
+    new_replay.size = n_copy
+    new_replay.ptr = n_copy % new_capacity  # next write goes after the copied block
+
+    return new_replay
