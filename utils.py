@@ -41,7 +41,10 @@ class ReplayBufferHybrid:
         action_dim: int,
         K_max: int = 32,
         dtype=np.float32,
+        seed: int | None = None,
     ):
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
         self.capacity = int(capacity)
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -145,7 +148,6 @@ class ReplayBufferHybrid:
         self,
         batch_size: int,
         device: torch.device | str,
-        rng: Optional[np.random.Generator] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Sample a batch and return torch tensors:
@@ -163,8 +165,7 @@ class ReplayBufferHybrid:
             raise RuntimeError("ReplayBufferHybrid is empty")
 
         B = int(batch_size)
-        rng = rng if rng is not None else np.random.default_rng()
-        idx = rng.integers(0, self.size, size=B)
+        idx = self.rng.integers(0, self.size, size=B)
 
         obs_t = torch.from_numpy(self.obs[idx]).to(device=device, dtype=torch.float32)
         mu_star_t = torch.from_numpy(self.mu_star[idx]).to(device=device, dtype=torch.float32)
@@ -418,7 +419,7 @@ def train_step_mcts_distill(
     net,
     optimizer,
     batch: Tuple[torch.Tensor, ...],
-    value_rms,
+    value_rms = None, #?
     value_target: str = "mc",
     w_value: float = 1.0,
     w_policy: float = 1.0,
@@ -814,13 +815,13 @@ def grow_replay(replay: ReplayBufferHybrid, new_capacity: int, *, keep_last: int
     start = (replay.ptr - n_copy) % replay.capacity
     idx = (start + np.arange(n_copy)) % replay.capacity
 
-    # allocate new buffer
     new_replay = ReplayBufferHybrid(
         capacity=new_capacity,
         obs_dim=replay.obs_dim,
         action_dim=replay.action_dim,
         K_max=replay.K_max,
         dtype=replay.dtype,
+        seed=replay.seed,
     )
 
     # copy arrays into the front of the new buffer
