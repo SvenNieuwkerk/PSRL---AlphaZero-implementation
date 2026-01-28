@@ -361,7 +361,7 @@ for it in range(num_iters+1):
     # ---- Train (baseline MLE/value regression) ----
     if len(replay) >= cfg.batch_size:
         for _ in range(cfg.train_steps_per_iter):
-            batch = replay.sample(cfg.batch_size, device=device, rng=np.random.default_rng(RNG_SEED))
+            batch = replay.sample(cfg.batch_size, device=device)
 
             if True:
                 loss_dict = train_step_mle(
