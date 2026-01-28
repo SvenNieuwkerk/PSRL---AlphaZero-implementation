@@ -32,7 +32,7 @@ from utils import (
     env_set_state,
 )
 
-print("test 123123")
+print("version 2")
 
 # --- Device ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,10 +52,11 @@ def set_global_seeds(seed: int):
 RNG_SEED = 42
 set_global_seeds(RNG_SEED)
 
-EVAL_DIR = "ckpt_3D_exploration_AC_stepwise"
-s = time.strftime("%d%m%Y_%H%M%S", time.localtime())
-#s = "temp2"
-EVAL_DIR = EVAL_DIR+"_"+s
+BASE_DIR = "eval_checkpoints"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+run_name = f"ckpt_3D_exploration_AC_stepwise_{time.strftime('%d%m%Y_%H%M%S', time.localtime())}"
+EVAL_DIR = os.path.join(BASE_DIR, run_name)
 os.makedirs(EVAL_DIR, exist_ok=True)
 
 # === Config ===
@@ -70,18 +71,18 @@ class Config:
     # ========================
     # MCTS core
     # ========================
-    num_simulations: int = 400    # Number of MCTS simulations per real environment step
-    cpuct: float = 4            # Exploration vs exploitation tradeoff in PUCT; Higher -> more exploration guided by policy prior
+    num_simulations: int = 200    # Number of MCTS simulations per real environment step
+    cpuct: float = 1            # Exploration vs exploitation tradeoff in PUCT; Higher -> more exploration guided by policy prior
     max_depth: int = 64           # Safety cap on tree depth during a simulation
 
     # For root action selection / Action sampling temperature at root
     # >1.0 = more stochastic, 1.0 = proportional to visits, ~0 = greedy
-    temperature: float = 1.0
+    temperature: float = 0.5
 
     # ========================
     # Progressive Widening
     # ========================
-    pw_k: float = 1.5
+    pw_k: float = 2.0
     # Controls how many actions are allowed per node:
     #   K_max = pw_k * N(s)^pw_alpha
     pw_alpha: float = 0.5
@@ -136,7 +137,7 @@ class Config:
     # ========================
     # Training
     # ========================
-    batch_size: int = 8
+    batch_size: int = 32
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     train_steps_per_iter: int = 50    # Gradient updates per outer iteration
@@ -149,7 +150,7 @@ class Config:
     # Data collection
     # ========================
     collect_episodes_per_iter: int = 10     # Number of real env episodes collected per training iteration
-    replay_buffer_capacity: int = batch_size
+    replay_buffer_capacity: int = 500
     gamma_mcts: float = 0.85     # Discount factor for return backup in MCTS
     gamma_mc = 0.9
 
@@ -192,9 +193,6 @@ env_sim_AC = ConditionalAdaptionEnvWrapper(env_sim,
                                         constraint_calculator.get_set_representation(),
                                         alpha_projection_interface_fn)
 
-# --- evaluation environment for evaluation during training ---
-env_eval, _ = create_exploration_seeker()
-
 def sync_conditional_adaption_wrapper(
     env_wrapped,
     obs,
@@ -229,7 +227,7 @@ def step_fn(node, action):
     env_set_state(env_sim_AC, node, num_obstacles=env_config.num_obstacles)
 
     # 2) sync wrapper cache
-    obs = np.asarray(node.state, dtype=env_sim.unwrapped._dtype)
+    obs = np.asarray(node.state, dtype=env_sim._dtype)
     sync_conditional_adaption_wrapper(
         env_sim_AC,
         obs,
@@ -317,9 +315,8 @@ eval_every_steps = 10_000            # evaluate periodically
 train_updates_per_step = 1           # 1 SGD update per env step
 
 # Buffer - Start small and grow
-cfg.batch_size = 8
 replay_buffer = ReplayBufferHybrid(
-    capacity=cfg.batch_size,     # Option A: small replay
+    capacity=cfg.replay_buffer_capacity,     # Option A: small replay
     obs_dim=obs_dim,
     action_dim=action_dim,
     K_max=16,
@@ -327,6 +324,7 @@ replay_buffer = ReplayBufferHybrid(
 )
 
 global_step = 0
+it = 0
 episode_return = 0.0
 episode_len = 0
 
@@ -340,17 +338,29 @@ while global_step < total_env_steps:
     # optional: grow batch size + replay
     # (simple schedule – adjust freely)
     if global_step == 20_000:
-        cfg.batch_size = 16
-        replay_buffer = grow_replay(replay_buffer, new_capacity=cfg.batch_size)
-        print("GROW batch_size -> 16, replay ->", cfg.batch_size)
+        for pg in optimizer.param_groups:
+            pg["lr"] = 2.5e-4
+        new_cap = 2000
+        new_batch = 32
+        cfg.batch_size = new_batch
+        replay_buffer = grow_replay(replay_buffer, new_capacity=new_cap)
+        print(f"GROW batch_size -> {new_batch}, replay -> {new_cap}")
     elif global_step == 60_000:
-        cfg.batch_size = 32
-        replay_buffer = grow_replay(replay_buffer, new_capacity=cfg.batch_size)
-        print("GROW batch_size -> 32, replay ->", cfg.batch_size)
+        for pg in optimizer.param_groups:
+            pg["lr"] = 2e-4
+        new_cap = 5000
+        new_batch = 64
+        cfg.batch_size = new_batch
+        replay_buffer = grow_replay(replay_buffer, new_capacity=new_cap)
+        print(f"GROW batch_size -> {new_batch}, replay -> {new_cap}")
     elif global_step == 120_000:
-        cfg.batch_size = 64
-        replay_buffer = grow_replay(replay_buffer, new_capacity=2 * cfg.batch_size)
-        print("GROW batch_size -> 64, replay ->", 2 * cfg.batch_size)
+        for pg in optimizer.param_groups:
+            pg["lr"] = 1.5e-4
+        new_cap = 10000
+        new_batch = 64
+        cfg.batch_size = new_batch
+        replay_buffer = grow_replay(replay_buffer, new_capacity=new_cap)
+        print(f"GROW batch_size -> {new_batch}, replay -> {new_cap}")
 
     # ---- 1 step collect (MCTS + env step + add to replay) ----
     root = planner.search(obs, coin_collected=coin_collected)
@@ -389,7 +399,7 @@ while global_step < total_env_steps:
     coin_collected = next_coin
 
     # ---- Online train (1 minibatch SGD step) ----
-    if len(replay_buffer) >= cfg.batch_size: # start training when replay_buffer is full and can be sampled
+    if len(replay_buffer) >= 10*cfg.batch_size: # start training when replay_buffer is full and can be sampled
         for _ in range(train_updates_per_step):
             batch = replay_buffer.sample(cfg.batch_size, device=device)
             loss_dict = train_step_mle(
@@ -408,6 +418,10 @@ while global_step < total_env_steps:
     if done or episode_len >= cfg.max_episode_steps:
         logs["ep_return"].append(float(episode_return))
         logs["ep_length"].append(int(episode_len))
+        if episode_return <= -100:
+            print("CRASH:", info)
+            print("agent pos:", env_real.unwrapped._agent_position)
+
 
         obs, info = env_real.reset()
         coin_collected = bool(getattr(env_real.unwrapped, "_coin_collected", False))
@@ -417,6 +431,10 @@ while global_step < total_env_steps:
         episode_return = 0.0
         episode_len = 0
         
+    # ---- disable warmstart ----
+    if global_step % 1000:
+        it += 1
+        planner.set_training_iter(it)
 
     # ---- Periodic checkpoint/eval ----
     if global_step % eval_every_steps == 0:
@@ -430,6 +448,10 @@ while global_step < total_env_steps:
             "optimizer": optimizer.state_dict(),
             "rng_seed": RNG_SEED,
             "cfg": cfg.__dict__,
+            "python_random_state": random.getstate(),
+            "numpy_random_state": np.random.get_state(),
+            "torch_random_state": torch.get_rng_state(),
+            "torch_cuda_random_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }, ckpt_path)
     
     if global_step % 100 == 0:

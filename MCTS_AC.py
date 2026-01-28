@@ -8,6 +8,8 @@ import math
 import torch
 import torch.nn as nn
 
+from plot_utils import decode_obs
+
 
 # --- Type aliases for clarity ---
 State = NDArray[np.generic]
@@ -490,10 +492,15 @@ class MCTSPlanner_AC:
             if was_adapted:
                 # ---- (1) Unsafe branch: proposed action => immediate terminal penalty ----
                 penalty = float(self.unsafe_penalty)
+                
+                agent, goal, obstacles, coin, dim = decode_obs(node.state, num_obstacles=10)
+                new_agent = agent + a_star_f
+                new_state = node.state.copy()
+                new_state[:dim] = new_agent
 
                 unsafe_child = node.add_child(
                     action=a_star.astype(np.float32),
-                    child_state=np.array(node.state, copy=True),  # keep valid shape (? node.state replace??)
+                    child_state=np.array(new_state, copy=True),  # keep valid shape (? node.state replace??)
                     prior_raw=prior_raw,
                     reward=penalty,
                 )
@@ -632,10 +639,10 @@ class MCTSPlanner_AC:
         q = float(edge.Q_sa)
 
         # Normalization
-        Q_values = [child.Q_sa for child in node.children]
-        Q_min, Q_max = min(Q_values), max(Q_values)
+        #Q_values = [child.Q_sa for child in node.children]
+        #Q_min, Q_max = min(Q_values), max(Q_values)
 
-        Q_norm = (q - Q_min) / (Q_max - Q_min + 1e-8)
+        #Q_norm = (q - Q_min) / (Q_max - Q_min + 1e-8)
 
         # Exploration term
         n_s = float(node.N)
@@ -645,7 +652,7 @@ class MCTSPlanner_AC:
         # If node.N is 0, sqrt(0)=0 and exploration is 0. That's fine.
         u = self.cpuct * p * (math.sqrt(n_s) / (1.0 + n_sa))
 
-        return Q_norm + u
+        return q + u
 
     def normalize_node_priors(self, node: "MCTSNode") -> None:
         """

@@ -294,8 +294,38 @@ def plot_mcts_tree_xy_limited(
         xc, yc = node_xy(chosen_child_node)
         ax.scatter([xc], [yc], s=140, alpha=0.9, label="Chosen child", zorder=9)
 
-    ax.set_xlim(-L, L)
-    ax.set_ylim(-L, L)
+    # scale plot
+    if L is None:
+        # autoscale around all plotted points with padding
+        pts = []
+
+        # root + nodes
+        pts.append(agent_xy)
+        pts.append(goal_xy)
+        if coin_xy is not None:
+            pts.append(coin_xy)
+
+        # obstacles (include radius)
+        for (xy, r) in zip(obs_xy, obs_r):
+            pts.append([xy[0] - r, xy[1] - r])
+            pts.append([xy[0] + r, xy[1] + r])
+
+        # tree nodes
+        for _, child, _ in edges:
+            x, y = node_xy(child)
+            pts.append([x, y])
+
+        pts = np.asarray(pts, dtype=float)
+        xmin, ymin = pts.min(axis=0)
+        xmax, ymax = pts.max(axis=0)
+
+        pad = 0.5
+        ax.set_xlim(xmin - pad, xmax + pad)
+        ax.set_ylim(ymin - pad, ymax + pad)
+    else:
+        ax.set_xlim(-L, L)
+        ax.set_ylim(-L, L)
+
     ax.set_aspect("equal", adjustable="box")
     if title:
         ax.set_title(title)
