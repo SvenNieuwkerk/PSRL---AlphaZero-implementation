@@ -31,6 +31,9 @@ from utils import (
     env_set_state,
 )
 
+
+print("test123")
+
 # --- Device ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -62,7 +65,7 @@ class Config:
     # ========================
     # Environment
     # ========================
-    max_episode_steps: int = 300  # max steps in environment before cut off (goal not reached, obstacle not crashed into --> prevent forever stepping)
+    max_episode_steps: int = 200  # max steps in environment before cut off (goal not reached, obstacle not crashed into --> prevent forever stepping)
 
     # ========================
     # MCTS core
@@ -147,7 +150,7 @@ class Config:
     # ========================
     collect_episodes_per_iter: int = 10     # Number of real env episodes collected per training iteration
     replay_buffer_capacity: int = 20*batch_size
-    gamma_mcts: float = 0.975      # Discount factor for return backup in MCTS
+    gamma_mcts: float = 0.8      # Discount factor for return backup in MCTS
     gamma_mc = 0.9
 
     # ========================
@@ -385,29 +388,16 @@ for it in range(num_iters+1):
         for _ in range(cfg.train_steps_per_iter):
             batch = replay.sample(cfg.batch_size, device=device)
 
-            if True:
-                loss_dict = train_step_mle(
-                    net=net,
-                    optimizer=optimizer,
-                    batch=batch,
-                    value_target="mcts",
-                    w_value=cfg.value_loss_weight,
-                    w_policy=cfg.policy_loss_weight,
-                    grad_clip_norm=1.0,
-                )
-            else:
-                loss_dict = train_step_mcts_distill(
-                    net=net,
-                    optimizer=optimizer,
-                    batch=batch,
-                    value_rms=None,
-                    value_target="mc",
-                    w_value=cfg.value_loss_weight,
-                    w_policy=cfg.policy_loss_weight,
-                    grad_clip_norm=1.0,
-                )
-            
-            
+            loss_dict = train_step_mle(
+                net=net,
+                optimizer=optimizer,
+                batch=batch,
+                value_target="mcts",
+                w_value=cfg.value_loss_weight,
+                w_policy=cfg.policy_loss_weight,
+                grad_clip_norm=1.0,
+            )
+        
             for k, v in loss_dict.items():
                 logs[k].append(v)
                 

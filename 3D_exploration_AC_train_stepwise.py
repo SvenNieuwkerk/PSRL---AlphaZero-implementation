@@ -17,10 +17,11 @@ import matplotlib.pyplot as plt
 from acorl.envs.seeker.seeker import SeekerEnv, SeekerEnvConfig
 
 # --- Own Code ---
-from MCTS import MCTSPlanner
+from MCTS_AC import MCTSPlanner_AC
 from network import SeekerAlphaZeroNet
 from utils import (
     ReplayBufferHybrid,
+    topk_from_policy,
     collect_one_episode_hybrid,
     train_step_mle,
     train_step_mcts_distill,
@@ -30,15 +31,8 @@ from utils import (
     grow_replay,
     env_set_state,
 )
-from plot_utils import (
-#    decode_obs,
-    plot_seeker_obs,
-    plot_seeker_trajectory,
-#    collect_tree_edges,
-    plot_mcts_tree_xy_limited,
-    inspect_debug_trace_xy,
-    plot_dbg_step,
-)
+
+print("test 123123")
 
 # --- Device ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,9 +52,9 @@ def set_global_seeds(seed: int):
 RNG_SEED = 42
 set_global_seeds(RNG_SEED)
 
-EVAL_DIR = "eval_traces_3D_exploration"
-#s = time.strftime("%d%m%Y_%H%M%S", time.localtime())
-s = "temp2"
+EVAL_DIR = "ckpt_3D_exploration_AC_stepwise"
+s = time.strftime("%d%m%Y_%H%M%S", time.localtime())
+#s = "temp2"
 EVAL_DIR = EVAL_DIR+"_"+s
 os.makedirs(EVAL_DIR, exist_ok=True)
 
@@ -71,13 +65,13 @@ class Config:
     # ========================
     # Environment
     # ========================
-    max_episode_steps: int = 200  # max steps in environment before cut off (goal not reached, obstacle not crashed into --> prevent forever stepping)
+    max_episode_steps: int = 300  # max steps in environment before cut off (goal not reached, obstacle not crashed into --> prevent forever stepping)
 
     # ========================
     # MCTS core
     # ========================
-    num_simulations: int = 200    # Number of MCTS simulations per real environment step
-    cpuct: float = 1.5            # Exploration vs exploitation tradeoff in PUCT; Higher -> more exploration guided by policy prior
+    num_simulations: int = 400    # Number of MCTS simulations per real environment step
+    cpuct: float = 4            # Exploration vs exploitation tradeoff in PUCT; Higher -> more exploration guided by policy prior
     max_depth: int = 64           # Safety cap on tree depth during a simulation
 
     # For root action selection / Action sampling temperature at root
@@ -142,10 +136,10 @@ class Config:
     # ========================
     # Training
     # ========================
-    batch_size: int = 128
+    batch_size: int = 8
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
-    train_steps_per_iter: int = 200    # Gradient updates per outer iteration
+    train_steps_per_iter: int = 50    # Gradient updates per outer iteration
 
     # (Only used by our baseline loss function)
     value_loss_weight: float = 1.0
@@ -155,15 +149,15 @@ class Config:
     # Data collection
     # ========================
     collect_episodes_per_iter: int = 10     # Number of real env episodes collected per training iteration
-    replay_buffer_capacity: int = 8*batch_size
-    gamma_mcts: float = 0.85      # Discount factor for return backup in MCTS
+    replay_buffer_capacity: int = batch_size
+    gamma_mcts: float = 0.85     # Discount factor for return backup in MCTS
     gamma_mc = 0.9
 
     # ========================
     # Logging / evaluation
     # ========================
     eval_every: int = 25
-    eval_episodes: int = 50   # use more fixed seeds for smoother eval curves
+    eval_episodes: int = 10   # use 10 fixed seeds for smoother eval curves
 
 
 cfg = Config()
@@ -172,6 +166,9 @@ cfg = Config()
 # === ENVIRONMENTS ===
 
 from rl_competition.competition.environment import create_exploration_seeker
+from acorl.envs.constraints.seeker import SeekerInputSetPolytopeCalculator
+from acorl.env_wrapper.adaption_fn import ConditionalAdaptionEnvWrapper
+from acorl.acrl_algos.alpha_projection.mapping import alpha_projection_interface_fn
 
 # --- Real environment for rollouts / data collection ---
 
@@ -185,27 +182,69 @@ print("obs_dim:", obs_dim, "action_dim:", action_dim)
 print("action_space:", env_real.action_space)
 
 # --- Simulation environment for MCTS step_fn ---
-env_sim, _ = create_exploration_seeker()
-_ = env_sim.reset() # otherwise order enforcing wrapper is crying
-# TODO: Think about using unwrapped env from here on
+env_sim, env_config_sim = create_exploration_seeker()
+env_sim = env_sim.unwrapped
+
+constraint_calculator = SeekerInputSetPolytopeCalculator(env_config=env_config_sim)
+env_sim_AC = ConditionalAdaptionEnvWrapper(env_sim, 
+                                        constraint_calculator.compute_relevant_input_set,
+                                        constraint_calculator.compute_fail_safe_input,
+                                        constraint_calculator.get_set_representation(),
+                                        alpha_projection_interface_fn)
 
 # --- evaluation environment for evaluation during training ---
 env_eval, _ = create_exploration_seeker()
 
+def sync_conditional_adaption_wrapper(
+    env_wrapped,
+    obs,
+    *,
+    constraint_calculator,
+):
+    """
+    Sync ConditionalAdaptionEnvWrapper cache after env_set_state().
+    """
+    info = {
+        "boundary_size": float(getattr(env_wrapped.unwrapped, "_size", 10.0)),  # SeekerEnv uses _size for boundary :contentReference[oaicite:2]{index=2}
+    }
+
+    # Compute constraint info for THIS obs
+    info["relevant_input_set"] = constraint_calculator.compute_relevant_input_set(obs, info)
+    info["fail_safe_input"] = constraint_calculator.compute_fail_safe_input(obs, info)
+
+    # Optional but harmless
+    if hasattr(env_wrapped.unwrapped, "_boundary_size"):
+        info["boundary_size"] = env_wrapped.unwrapped._boundary_size
+
+    env_wrapped._previous_obs = obs
+    env_wrapped._previous_info = info
+
 def step_fn(node, action):
     """
     MCTS transition function: set env_sim to `state`, take `action`, return next_state/reward/done/info.
+    USES ACTION CONSTRAINED ENVIRONMENT
     Returns: next_state, reward, done, info  (matching MCTSPlanner expectations)
     """
-    env_set_state(env_sim, node, num_obstacles=env_config.num_obstacles)
+    # 1) teleport base env
+    env_set_state(env_sim_AC, node, num_obstacles=env_config.num_obstacles)
 
-    action = np.asarray(action, dtype=env_sim.unwrapped._dtype)
-    next_obs, reward, terminated, truncated, info = env_sim.unwrapped.step(action)
+    # 2) sync wrapper cache
+    obs = np.asarray(node.state, dtype=env_sim.unwrapped._dtype)
+    sync_conditional_adaption_wrapper(
+        env_sim_AC,
+        obs,
+        constraint_calculator=constraint_calculator,
+    )
 
-    next_obs = np.array(next_obs, copy=True) #break reference to internal env buffer
+
+    # 3) step the WRAPPED env
+    action = np.asarray(action, dtype=env_sim_AC.unwrapped._dtype)
+    next_obs, reward, terminated, truncated, info = env_sim_AC.step(action)
+
+    next_obs = np.array(next_obs, copy=True) #break reference to internal env buffer (??)
     
     done = bool(terminated or truncated)
-    next_coin_collected = bool(getattr(env_sim, "_coin_collected", False))
+    next_coin_collected = bool(getattr(env_sim_AC.unwrapped, "_coin_collected", False))
     
     return next_obs, next_coin_collected, reward, done, info 
 
@@ -225,7 +264,7 @@ print("v:", v_t.item())
 optimizer = optim.AdamW(net.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
 # === PLANNER === 
-planner = MCTSPlanner(
+planner = MCTSPlanner_AC(
     net=net,
     device=str(device),
     step_fn=step_fn,
@@ -249,14 +288,7 @@ planner = MCTSPlanner(
     max_resample_attempts=cfg.max_resample_attempts,
 )
 
-# === BUFFER AND LOGS ===
-# Buffer
-replay = ReplayBufferHybrid(
-    capacity=cfg.replay_buffer_capacity,
-    obs_dim=obs_dim,
-    action_dim=action_dim,
-    K_max=32,
-)
+# === LOGS ===
 
 # Logging containers (easy to plot later)
 logs = {
@@ -280,89 +312,86 @@ logs = {
 }
 
 # === TRAINING ===
-EVAL_SEEDS = list(range(1000, 1000 + cfg.eval_episodes))  # fixed "validation set"
+total_env_steps = 200_000            # like paper x-axis
+eval_every_steps = 10_000            # evaluate periodically
+train_updates_per_step = 1           # 1 SGD update per env step
 
-eval_stats, traces = run_eval_episodes(
-            env_eval=env_eval,
-            planner=planner,
-            seeds=EVAL_SEEDS,
-            max_steps=cfg.max_episode_steps,
-            goal_reward=env_eval.unwrapped._goal_reward,
-            collision_reward=env_eval.unwrapped._collision_reward,
-        )
+# Buffer - Start small and grow
+cfg.batch_size = 8
+replay_buffer = ReplayBufferHybrid(
+    capacity=cfg.batch_size,     # Option A: small replay
+    obs_dim=obs_dim,
+    action_dim=action_dim,
+    K_max=16,
+    seed=RNG_SEED,
+)
 
-for seed, tr in traces.items():
-    tr["training_iteration"] = 0
+global_step = 0
+episode_return = 0.0
+episode_len = 0
 
-path = os.path.join(EVAL_DIR, f"traces_ep000000.pkl")
-    
-with open(path, "wb") as f:
-    pickle.dump(traces, f)
-
-
-num_iters = 400
+obs, info = env_real.reset()
+coin_collected = bool(getattr(env_real.unwrapped, "_coin_collected", False))
 
 start_time = time.perf_counter()
-print("START")
+print("START ONLINE TRAINING")
 
-episodes_collected = 0
-episodes_to_collect = 100
+while global_step < total_env_steps:
+    # optional: grow batch size + replay
+    # (simple schedule – adjust freely)
+    if global_step == 20_000:
+        cfg.batch_size = 16
+        replay_buffer = grow_replay(replay_buffer, new_capacity=cfg.batch_size)
+        print("GROW batch_size -> 16, replay ->", cfg.batch_size)
+    elif global_step == 60_000:
+        cfg.batch_size = 32
+        replay_buffer = grow_replay(replay_buffer, new_capacity=cfg.batch_size)
+        print("GROW batch_size -> 32, replay ->", cfg.batch_size)
+    elif global_step == 120_000:
+        cfg.batch_size = 64
+        replay_buffer = grow_replay(replay_buffer, new_capacity=2 * cfg.batch_size)
+        print("GROW batch_size -> 64, replay ->", 2 * cfg.batch_size)
 
-episode_success = np.zeros(episodes_to_collect, dtype = bool)
-episode_collision = np.zeros(episodes_to_collect, dtype = bool)
-episode_max_step = np.zeros(episodes_to_collect)
-episode_reward = np.full((episodes_to_collect, cfg.max_episode_steps),np.nan,dtype=float)
-episode_z_mc = np.full((episodes_to_collect, cfg.max_episode_steps),np.nan,dtype=float)
-episode_z_mcts = np.full((episodes_to_collect, cfg.max_episode_steps),np.nan,dtype=float)
+    # ---- 1 step collect (MCTS + env step + add to replay) ----
+    root = planner.search(obs, coin_collected=coin_collected)
+    probs, actions = planner.policy_from_root(root)  # probs: (K,), actions: (K, action_dim)
+    probs, actions = topk_from_policy(probs, actions, replay_buffer.K_max)
 
-for it in range(num_iters+1):
-    now = time.perf_counter()
-    print(f"main loop iter: {it}")
-    print(f"time: {now-start_time}")
-    last_time = now
-    
-    planner.set_training_iter(it)
+    mu_star, log_std_star, z_mcts = planner.targets_from_root(root)
 
-    # ---- Replay buffer size increase ----
-    if it == 40:
-        replay = grow_replay(replay, new_capacity=20 * cfg.batch_size)
-    elif it == 100:
-        replay = grow_replay(replay, new_capacity=50 * cfg.batch_size)
+    # execute action
+    action = planner.act(root, training=True)
+    next_obs, reward, terminated, truncated, info = env_real.step(action)
+    done = bool(terminated or truncated)
+    next_coin = bool(getattr(env_real.unwrapped, "_coin_collected", False))
 
-    # ---- Collect ----
-    ep_returns = []
-    for _ in range(cfg.collect_episodes_per_iter):
-        stats, episode = collect_one_episode_hybrid(
-            env_real=env_real,
-            planner=planner,
-            replay_buffer=replay,
-            max_steps=cfg.max_episode_steps,
-            gamma=cfg.gamma_mc,
-            training=True,
-        )
-        if episodes_collected < episodes_to_collect:
-            episode_success[episodes_collected] = stats["success"]
-            episode_collision[episodes_collected] = stats["collision"]
-            episode_max_step[episodes_collected] = stats["max_steps_reached"]
-            for i, step in enumerate(episode):
-                episode_reward[episodes_collected, i] = step["reward"]
-                episode_z_mc[episodes_collected, i] = step["z_mc"]
-                episode_z_mcts[episodes_collected, i] = step["z_mcts"]
-        episodes_collected += 1
+    replay_buffer.add(
+        obs,
+        mu_star,
+        log_std_star,
+        float(z_mcts),
+        0.0, # z_mc unused
+        actions,
+        probs,
+    )
 
-        ep_returns.append(stats["return"])
-        logs["ep_return"].append(stats["return"])
-        logs["ep_length"].append(stats["length"])
-        
-    now = time.perf_counter()
-    print("COLLECT loop time:", now - last_time)
-    last_time = now
+    step_record = {
+        "z_mcts": float(z_mcts),
+        "reward": float(reward),
+        "done": done,
+    }
 
-    # ---- Train (baseline MLE/value regression) ----
-    if len(replay) >= cfg.batch_size:
-        for _ in range(cfg.train_steps_per_iter):
-            batch = replay.sample(cfg.batch_size, device=device)
+    episode_return += reward
+    episode_len += 1
+    global_step += 1
 
+    obs = next_obs
+    coin_collected = next_coin
+
+    # ---- Online train (1 minibatch SGD step) ----
+    if len(replay_buffer) >= cfg.batch_size: # start training when replay_buffer is full and can be sampled
+        for _ in range(train_updates_per_step):
+            batch = replay_buffer.sample(cfg.batch_size, device=device)
             loss_dict = train_step_mle(
                 net=net,
                 optimizer=optimizer,
@@ -372,60 +401,39 @@ for it in range(num_iters+1):
                 w_policy=cfg.policy_loss_weight,
                 grad_clip_norm=1.0,
             )
-            
             for k, v in loss_dict.items():
                 logs[k].append(v)
-                
-        now = time.perf_counter()
-        print("TRAIN loop time:", now - last_time)
-        last_time = now
 
-    # ---- Eval (fixed seeds) ----
-    if it != 0 and (it % cfg.eval_every) == 0:
-        eval_stats, traces = run_eval_episodes(
-            env_eval=env_eval,
-            planner=planner,
-            seeds=EVAL_SEEDS,
-            max_steps=cfg.max_episode_steps,
-            goal_reward=env_eval.unwrapped._goal_reward,
-            collision_reward=env_eval.unwrapped._collision_reward,
-        )
+    # ---- Episode end / max steps ----
+    if done or episode_len >= cfg.max_episode_steps:
+        logs["ep_return"].append(float(episode_return))
+        logs["ep_length"].append(int(episode_len))
 
-        for seed, tr in traces.items():
-            tr["training_iteration"] = it
+        obs, info = env_real.reset()
+        coin_collected = bool(getattr(env_real.unwrapped, "_coin_collected", False))
+        print(f"Train episode ended: Length: {episode_len}, Reward: {episode_return}")
+        if episode_return > 0:
+            print("                POSITIVE REWARD")
+        episode_return = 0.0
+        episode_len = 0
+        
 
-        path = os.path.join(EVAL_DIR, f"traces_ep{it:06d}.pkl")
+    # ---- Periodic checkpoint/eval ----
+    if global_step % eval_every_steps == 0:
+        elapsed = time.perf_counter() - start_time
+        print(f"[step {global_step}] elapsed={elapsed:.1f}s | last_loss={logs['loss_total'][-1] if logs['loss_total'] else None}")
+
+        ckpt_path = os.path.join(EVAL_DIR, f"ckpt_step_{global_step:09d}.pt")
+        torch.save({
+            "step": global_step,
+            "net": net.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "rng_seed": RNG_SEED,
+            "cfg": cfg.__dict__,
+        }, ckpt_path)
     
-        with open(path, "wb") as f:
-            pickle.dump(traces, f)
-
-        
-        logs["iter_idx_eval"].append(it)
-        logs["eval_return_mean"].append(eval_stats["eval_return_mean"])
-        logs["eval_return_std"].append(eval_stats["eval_return_std"])
-        logs["eval_length_mean"].append(eval_stats["eval_length_mean"])
-        logs["success_rate"].append(eval_stats["success_rate"])
-        logs["collision_rate"].append(eval_stats["collision_rate"])
-        logs["eval_length_succes"].append(eval_stats["eval_length_mean_successes"])
-        logs["eval_length_collision"].append(eval_stats["eval_length_mean_collisions"])
-        logs["max_step_rate"].append(eval_stats["max_step_rate"])
-
+    if global_step % 100 == 0:
+        print("global step: ", global_step)
         now = time.perf_counter()
-        print("EVAL time:", now - last_time)
+        print(f"time: {now-start_time}")
         last_time = now
-        
-        print(
-            f"[Eval it={it}] "
-            f"R={eval_stats['eval_return_mean']:.2f}±{eval_stats['eval_return_std']:.2f} "
-            f"succ={eval_stats['success_rate']:.2f} "
-            f"coll={eval_stats['collision_rate']:.2f} "
-            f"max={eval_stats['max_step_rate']:.2f} "
-            f"len_suc={eval_stats['eval_length_mean_successes']:.1f} "
-            f"len_col={eval_stats['eval_length_mean_collisions']:.1f} "
-        )
-
-    last_loss = logs["loss_total"][-1] if logs["loss_total"] else None
-    print(
-        f"Iter {it} | replay={len(replay)} | "
-        f"train_return_mean={np.mean(ep_returns):.2f} | last_loss={last_loss}"
-    )
