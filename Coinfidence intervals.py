@@ -3,7 +3,11 @@ import numpy as np
 
 def confidence_intervals(data_line, bootstrap_resamples = 5000):
     """
+    input:
     data_line: assumed to be n x t, where n is the number of evaluation runs and t is the number of evaluations periods
+
+    output:
+    lines: 3 x t, t is still the number of evaluation periods. First row has lower bound, second row has the mean, third row has the upper bound
     """
 
     N, T = data_line.shape
