@@ -50,6 +50,7 @@ class MCTSNode:
     v: Optional[float] = None
 
     is_terminal: bool = False
+    is_projected_unsafe: Optional[bool] = None
     terminal_value: Optional[float] = None
 
     def is_fully_expanded(self, k: float, alpha: float) -> bool:
@@ -506,6 +507,7 @@ class MCTSPlanner_AC:
                 )
                 unsafe_child.coin_collected = bool(node.coin_collected)
                 unsafe_child.is_terminal = True
+                unsafe_child.is_projected_unsafe = True
                 unsafe_child.terminal_value = float(self.terminal_mapping(penalty, {"unsafe_proposed": True}))
                 unsafe_edge = node.children[-1]
 

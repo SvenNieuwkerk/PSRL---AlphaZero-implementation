@@ -167,9 +167,6 @@ def plot_seeker_trajectory(
     plt.show()
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-
 def plot_mcts_tree_xy_limited(
     root,
     *,
@@ -180,45 +177,52 @@ def plot_mcts_tree_xy_limited(
     max_depth=6,
     top_k_per_node=5,
     chosen_child_idx=None,
-    # optional radii circles (pass from env/unwrapped if you have them)
     goal_radius=None,
     coin_radius=None,
     show_goal_radius=True,
     show_coin_radius=True,
+    edge_color="0.25",
+    chosen_edge_color=None,
+    nonterminal_node_color=None,
+    terminal_node_color="tab:red",
+    unsafe_node_color="tab:orange",
 ):
-    """
-    Plot MCTS tree projected into XY (first two dims), limited by depth and top-K children per node.
-
-    Works for 2D/3D and coin/no-coin observations (coin position must be in obs if present).
-    For 3D obstacles/goal/agent/coin: only XY is drawn; Z is ignored (projection).
-    """
-    # --- decode ---
     obs = root.state
-    agent, goal, obstacles, coin, dim = decode_obs(np.asarray(obs), num_obstacles=int(num_obstacles))
+    agent, goal, obstacles, coin, dim = decode_obs(
+        np.asarray(obs), num_obstacles=int(num_obstacles)
+    )
     agent_xy = np.asarray(agent[:2], dtype=float)
-    goal_xy  = np.asarray(goal[:2], dtype=float)
+    goal_xy = np.asarray(goal[:2], dtype=float)
 
-    # obstacles: (N, dim+1) with last column radius
     obstacles = np.asarray(obstacles, dtype=float)
     obs_xy = obstacles[:, :2] if obstacles.size else obstacles.reshape(0, 2)
-    obs_r  = obstacles[:, dim] if obstacles.size else np.zeros((0,), dtype=float)
+    obs_r = obstacles[:, dim] if obstacles.size else np.zeros((0,), dtype=float)
 
     coin_xy = None
     if coin is not None:
         coin_xy = np.asarray(coin[:2], dtype=float)
 
     def node_xy(node):
-        a, _, _, _, _ = decode_obs(np.asarray(node.state), num_obstacles=int(num_obstacles))
+        a, _, _, _, _ = decode_obs(
+            np.asarray(node.state), num_obstacles=int(num_obstacles)
+        )
         a = np.asarray(a, dtype=float)
         return float(a[0]), float(a[1])
 
-    # chosen child node (optional)
+    def is_terminal(node):
+        return bool(getattr(node, "is_terminal", False))
+
+    def is_projected_unsafe(node):
+        return bool(getattr(node, "is_projected_unsafe", False))
+
     chosen_child_node = None
-    if chosen_child_idx is not None and 0 <= int(chosen_child_idx) < len(getattr(root, "children", [])):
+    if (
+        chosen_child_idx is not None
+        and 0 <= int(chosen_child_idx) < len(getattr(root, "children", []))
+    ):
         chosen_child_node = root.children[int(chosen_child_idx)].child_node
 
-    # --- traverse (limited) ---
-    edges = []  # (parent, child, is_chosen_root_edge)
+    edges = []
     stack = [(root, 0)]
     seen = set()
 
@@ -238,82 +242,146 @@ def plot_mcts_tree_xy_limited(
 
         for ch in children:
             child = ch.child_node
-            is_chosen = (node is root and chosen_child_node is child)
+            is_chosen = node is root and chosen_child_node is child
             edges.append((node, child, is_chosen))
             stack.append((child, depth + 1))
 
-    # --- plot ---
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
-    # obstacles (XY projection)
     for (xy, r) in zip(obs_xy, obs_r):
-        ax.add_patch(plt.Circle((float(xy[0]), float(xy[1])), float(r), alpha=0.25))
+        ax.add_patch(
+            plt.Circle((float(xy[0]), float(xy[1])), float(r), alpha=0.25)
+        )
 
-    # goal (+ radius if provided)
     ax.scatter(goal_xy[0], goal_xy[1], s=120, marker="*", label="Goal", zorder=6)
     if show_goal_radius and goal_radius is not None:
-        ax.add_patch(plt.Circle((goal_xy[0], goal_xy[1]), float(goal_radius),
-                                fill=False, linewidth=2, alpha=0.8, zorder=5))
+        ax.add_patch(
+            plt.Circle(
+                (goal_xy[0], goal_xy[1]),
+                float(goal_radius),
+                fill=False,
+                linewidth=2,
+                alpha=0.8,
+                zorder=5,
+            )
+        )
 
-    # coin (+ radius if provided)
     if coin_xy is not None:
         ax.scatter(coin_xy[0], coin_xy[1], s=90, marker="o", label="Coin", zorder=6)
         if show_coin_radius and coin_radius is not None:
-            ax.add_patch(plt.Circle((coin_xy[0], coin_xy[1]), float(coin_radius),
-                                    fill=False, linewidth=2, alpha=0.8, zorder=5))
+            ax.add_patch(
+                plt.Circle(
+                    (coin_xy[0], coin_xy[1]),
+                    float(coin_radius),
+                    fill=False,
+                    linewidth=2,
+                    alpha=0.8,
+                    zorder=5,
+                )
+            )
 
-    # agent
     ax.scatter(agent_xy[0], agent_xy[1], s=90, label="Agent (obs)", zorder=7)
 
-    # edges (avoid duplicate legend labels)
     drew_chosen_label = False
+    if chosen_edge_color is None:
+        chosen_edge_color = edge_color
+
     for parent, child, is_chosen in edges:
         x0, y0 = node_xy(parent)
         x1, y1 = node_xy(child)
+
         if is_chosen:
-            ax.plot([x0, x1], [y0, y1], linewidth=3, alpha=0.9, zorder=4,
-                    label=("Chosen edge" if not drew_chosen_label else None))
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                color=chosen_edge_color,
+                linewidth=3,
+                alpha=0.9,
+                zorder=4,
+                label=("Chosen edge" if not drew_chosen_label else None),
+            )
             drew_chosen_label = True
         else:
-            ax.plot([x0, x1], [y0, y1], linewidth=1, alpha=0.30, zorder=3)
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                color=edge_color,
+                linewidth=1,
+                alpha=0.30,
+                zorder=3,
+            )
 
-    # nodes
-    xs, ys = [], []
+    # --- classify nodes ---
+    xs_nt, ys_nt = [], []
+    xs_t, ys_t = [], []
+    xs_u, ys_u = [], []
+
     for _, child, _ in edges:
         x, y = node_xy(child)
-        xs.append(x); ys.append(y)
+
+        # unsafe overrides terminal coloring
+        if is_projected_unsafe(child):
+            xs_u.append(x)
+            ys_u.append(y)
+        elif is_terminal(child):
+            xs_t.append(x)
+            ys_t.append(y)
+        else:
+            xs_nt.append(x)
+            ys_nt.append(y)
 
     xr, yr = node_xy(root)
     ax.scatter([xr], [yr], s=90, marker="s", label="MCTS root", zorder=8)
-    if xs:
-        ax.scatter(xs, ys, s=18, alpha=0.45, label="Tree nodes", zorder=4)
 
-    # chosen child node
+    if xs_nt:
+        ax.scatter(
+            xs_nt,
+            ys_nt,
+            s=18,
+            alpha=0.45,
+            label="Tree nodes",
+            zorder=4,
+            **({} if nonterminal_node_color is None else {"color": nonterminal_node_color}),
+        )
+
+    if xs_t:
+        ax.scatter(
+            xs_t,
+            ys_t,
+            s=22,
+            alpha=0.75,
+            color=terminal_node_color,
+            label="Terminal nodes",
+            zorder=5,
+        )
+
+    if xs_u:
+        ax.scatter(
+            xs_u,
+            ys_u,
+            s=26,
+            alpha=0.85,
+            color=unsafe_node_color,
+            label="Projected unsafe",
+            zorder=6,
+        )
+
     if chosen_child_node is not None:
         xc, yc = node_xy(chosen_child_node)
         ax.scatter([xc], [yc], s=140, alpha=0.9, label="Chosen child", zorder=9)
 
-    # scale plot
     if L is None:
-        # autoscale around all plotted points with padding
-        pts = []
-
-        # root + nodes
-        pts.append(agent_xy)
-        pts.append(goal_xy)
+        pts = [agent_xy, goal_xy]
         if coin_xy is not None:
             pts.append(coin_xy)
 
-        # obstacles (include radius)
         for (xy, r) in zip(obs_xy, obs_r):
             pts.append([xy[0] - r, xy[1] - r])
             pts.append([xy[0] + r, xy[1] + r])
 
-        # tree nodes
         for _, child, _ in edges:
-            x, y = node_xy(child)
-            pts.append([x, y])
+            pts.append(node_xy(child))
 
         pts = np.asarray(pts, dtype=float)
         xmin, ymin = pts.min(axis=0)
