@@ -177,8 +177,15 @@ class MCTSPlanner_AC:
         self.unsafe_penalty = float(unsafe_penalty)
         self.adapt_eps = float(adapt_eps)
 
+        # Bootstrapping
+        self.use_bootstrap: bool = True
+
     # -------- Public API --------
-    
+    def deactivate_bootstrapping(self) -> None:
+        self.use_bootstrap = False
+
+    def activate_bootstrapping(self) -> None:
+        self.use_bootstrap = True
     
     def set_training_iter(self, it: int) -> None:
         self.training_iter = int(it)
@@ -336,17 +343,17 @@ class MCTSPlanner_AC:
 
             # --- Case 2: first visit to this node (no policy/value cached yet) ---
             if node.v is None:
-                leaf_value = float(self.evaluate_node(node))
+                leaf_value = float(self._leaf_value_nonterminal(node))
                 break
 
             # --- Case 3: depth cutoff (truncate search) ---
             if depth >= self.max_depth:
-                leaf_value = float(node.v)
+                leaf_value = float(self._leaf_value_nonterminal(node))
                 break
 
             # --- Case 4: expansion allowed (progressive widening) ---
             if not self.is_fully_expanded(node):
-                out = self.expand_child(node)
+                out = self.expand_child(node, depth)
 
                 if out is not None:
                     for o in out:
@@ -357,7 +364,7 @@ class MCTSPlanner_AC:
                         if done:
                             leaf_value = float(edge.child_node.terminal_value)
                         else:
-                            leaf_value = float(self.evaluate_node(edge.child_node))
+                            leaf_value = float(self._leaf_value_nonterminal(node))
                         
                         self.backup(path2, leaf_value)
                     return leaf_value #TODO: 2 leaf values, 1 for each edge?
@@ -416,7 +423,7 @@ class MCTSPlanner_AC:
 
         return best_edge
 
-    def expand_child(self, node: "MCTSNode") -> Optional[List[Tuple["Child", float, bool]]]:
+    def expand_child(self, node: "MCTSNode", depth: int) -> Optional[List[Tuple["Child", float, bool]]]:
         """
         Try to expand exactly one *novel* child from node (sample a new action).
 
@@ -439,7 +446,7 @@ class MCTSPlanner_AC:
 
         A_existing = self._existing_actions(node)
 
-        use_uniform = self._use_uniform_warmstart(node)
+        use_uniform = self._use_uniform_warmstart(node, depth)
 
         # Try multiple times to find something novel
         attempts = max(1, self.max_resample_attempts)
@@ -771,10 +778,25 @@ class MCTSPlanner_AC:
         div = self._diversity_penalty(a, A_existing)
         return float(self.policy_beta * logp - self.diversity_lambda * div)
 
-    def _use_uniform_warmstart(self, node: "MCTSNode") -> bool:
-        if self.warmstart_iters > 0 and self.training_iter < self.warmstart_iters:
-            return True
-        if self.K_uniform_per_node > 0 and len(node.children) < self.K_uniform_per_node:
-            return True
-        return False
+    def _use_uniform_warmstart(self, node: "MCTSNode", depth: int) -> bool:
+        # Only during warmstart iterations
+        if not (self.warmstart_iters > 0 and self.training_iter < self.warmstart_iters):
+            return False
+
+        # Root-only
+        if depth != 0:
+            return False
+
+        # Cap number of uniform children at root
+        return self.K_uniform_per_node > 0 and len(node.children) < self.K_uniform_per_node
+    
+    def _leaf_value_nonterminal(self, node: "MCTSNode") -> float:
+        """
+        Value used when we stop at a non-terminal leaf (new node, depth cutoff, newly expanded child).
+        If bootstrapping is disabled, returns 0.0.
+        """
+        if not self.use_bootstrap:
+            return 0.0
+        return float(self.evaluate_node(node))
+
     

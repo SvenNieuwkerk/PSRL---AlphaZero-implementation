@@ -435,7 +435,19 @@ def plot_dbg_step(
     nsig=1.0,
     zoom=True,
     zoom_pad=0.5,      # extra margin around tree
-    min_zoom_span=2.0  # minimum width/height so you don't over-zoom
+    min_zoom_span=2.0, # minimum width/height so you don't over-zoom
+
+    # --- styling / semantics (mirrors plot_mcts_tree_xy_limited) ---
+    chosen_child_idx=None,          # if provided, overrides dbg["chosen_idx"][k]
+    goal_radius=None,
+    coin_radius=None,
+    show_goal_radius=True,
+    show_coin_radius=True,
+    edge_color="0.25",
+    chosen_edge_color=None,
+    nonterminal_node_color=None,
+    terminal_node_color="tab:red",
+    unsafe_node_color="tab:orange",
 ):
     roots = dbg["roots"]
     states = dbg["states"]
@@ -454,16 +466,37 @@ def plot_dbg_step(
         _, ax = plt.subplots(figsize=(6, 6))
 
     # --- environment (XY projection) ---
-    for row in obstacles:
-        ox, oy = float(row[0]), float(row[1])
-        r = float(row[-1])
-        ax.add_patch(plt.Circle((ox, oy), r, alpha=0.3))
-    ax.scatter(float(goal[0]), float(goal[1]), s=120, marker="*", label="Goal", zorder=6)
+    # Match the look of plot_mcts_tree_xy_limited
+    if obstacles is None:
+        obstacles = np.zeros((0, dim + 1), dtype=float)
+    obstacles = np.asarray(obstacles, dtype=float)
+
+    obs_xy = obstacles[:, :2] if obstacles.size else obstacles.reshape(0, 2)
+    obs_r = obstacles[:, dim] if obstacles.size else np.zeros((0,), dtype=float)
+
+    for (xy, r) in zip(obs_xy, obs_r):
+        ax.add_patch(plt.Circle((float(xy[0]), float(xy[1])), float(r), alpha=0.25))
+
+    gx, gy = float(goal[0]), float(goal[1])
+    ax.scatter(gx, gy, s=120, marker="*", label="Goal", zorder=6)
+    if show_goal_radius and goal_radius is not None:
+        ax.add_patch(
+            plt.Circle((gx, gy), float(goal_radius), fill=False, linewidth=2, alpha=0.8, zorder=5)
+        )
+
     if coin is not None:
-        ax.scatter(float(coin[0]), float(coin[1]), s=90, marker="o", label="Coin", zorder=6)
+        cx, cy = float(coin[0]), float(coin[1])
+        ax.scatter(cx, cy, s=90, marker="o", label="Coin", zorder=6)
+        if show_coin_radius and coin_radius is not None:
+            ax.add_patch(
+                plt.Circle((cx, cy), float(coin_radius), fill=False, linewidth=2, alpha=0.8, zorder=5)
+            )
 
     # --- past trajectory (0..k) ---
-    agents = np.array([decode_obs(s, num_obstacles=num_obstacles)[0][:2] for s in states[: k + 1]])
+    agents = np.array(
+        [decode_obs(s, num_obstacles=num_obstacles)[0][:2] for s in states[: k + 1]],
+        dtype=float,
+    )
     t = np.arange(len(agents))
     ax.plot(agents[:, 0], agents[:, 1], linewidth=2, alpha=0.5, zorder=2)
     sc = ax.scatter(agents[:, 0], agents[:, 1], c=t, cmap="viridis", s=25, zorder=3)
@@ -475,11 +508,29 @@ def plot_dbg_step(
     # --- helpers for tree ---
     def node_xy(node):
         a, _, _, _, _ = decode_obs(np.asarray(node.state), num_obstacles=num_obstacles)
+        a = np.asarray(a, dtype=float)
         return float(a[0]), float(a[1])
 
-    # chosen child node
+    def is_terminal(node):
+        return bool(getattr(node, "is_terminal", False))
+
+    def is_projected_unsafe(node):
+        return bool(getattr(node, "is_projected_unsafe", False))
+
+    def node_color(node):
+        if is_projected_unsafe(node):
+            return unsafe_node_color
+        if is_terminal(node):
+            return terminal_node_color
+        return nonterminal_node_color if nonterminal_node_color is not None else "0.10"
+
+    # chosen child node (support both dbg["chosen_idx"][k] and explicit override)
     chosen_child_node = None
-    cidx = int(chosen_idx[k]) if k < len(chosen_idx) else None
+    if chosen_child_idx is not None:
+        cidx = int(chosen_child_idx)
+    else:
+        cidx = int(chosen_idx[k]) if k < len(chosen_idx) else None
+
     if cidx is not None and 0 <= cidx < len(getattr(root, "children", [])):
         chosen_child_node = root.children[cidx].child_node
 
@@ -487,7 +538,8 @@ def plot_dbg_step(
     edges = []
     stack = [(root, 0)]
     seen = set()
-    tree_pts = []  # for zoom
+    nodes_in_tree = []  # preserve order for plotting
+    tree_pts = []       # for zoom
 
     while stack:
         node, depth = stack.pop()
@@ -495,6 +547,8 @@ def plot_dbg_step(
         if nid in seen:
             continue
         seen.add(nid)
+
+        nodes_in_tree.append(node)
 
         x, y = node_xy(node)
         tree_pts.append((x, y))
@@ -512,28 +566,53 @@ def plot_dbg_step(
             edges.append((node, child, is_chosen))
             stack.append((child, depth + 1))
 
+    # --- edges (match plot_mcts_tree_xy_limited styling knobs) ---
     for parent, child, is_chosen in edges:
         x0, y0 = node_xy(parent)
         x1, y1 = node_xy(child)
         if is_chosen:
-            ax.plot([x0, x1], [y0, y1], linewidth=3, alpha=0.9, zorder=5)
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                linewidth=3,
+                alpha=0.9,
+                zorder=5,
+                color=(chosen_edge_color if chosen_edge_color is not None else edge_color),
+            )
         else:
-            ax.plot([x0, x1], [y0, y1], linewidth=1, alpha=0.25, zorder=4)
+            ax.plot([x0, x1], [y0, y1], linewidth=1, alpha=0.25, zorder=4, color=edge_color)
 
-    xs, ys = [], []
-    for _, child, _ in edges:
-        x, y = node_xy(child)
-        xs.append(x); ys.append(y)
-        tree_pts.append((x, y))
-
+    # --- nodes (colored by terminal / unsafe like plot_mcts_tree_xy_limited) ---
+    # Plot root distinctly, but keep semantic color.
     xr, yr = node_xy(root)
-    ax.scatter([xr], [yr], s=70, marker="s", label="MCTS root", zorder=9)
-    if xs:
-        ax.scatter(xs, ys, s=18, alpha=0.35, zorder=6)
+    ax.scatter([xr], [yr], s=70, marker="s", color=node_color(root), label="MCTS root", zorder=9)
 
+    # Plot all children nodes (and deeper) with semantic colors.
+    child_nodes = [child for (_, child, _) in edges]
+    if child_nodes:
+        xs = [node_xy(n)[0] for n in child_nodes]
+        ys = [node_xy(n)[1] for n in child_nodes]
+        cs = [node_color(n) for n in child_nodes]
+        ax.scatter(xs, ys, s=22, alpha=0.55, c=cs, zorder=6)
+
+        # include in zoom bounds
+        for x, y in zip(xs, ys):
+            tree_pts.append((x, y))
+
+    # Highlight chosen child (bigger marker), but keep semantic color.
     if chosen_child_node is not None:
         xc, yc = node_xy(chosen_child_node)
-        ax.scatter([xc], [yc], s=120, alpha=0.9, label="Chosen child", zorder=10)
+        ax.scatter(
+            [xc],
+            [yc],
+            s=140,
+            alpha=0.95,
+            color=node_color(chosen_child_node),
+            edgecolors="k",
+            linewidths=0.8,
+            label="Chosen child",
+            zorder=10,
+        )
         tree_pts.append((xc, yc))
 
     # --- Gaussian ellipses (uses first 2 dims of action as XY delta) ---
@@ -545,35 +624,76 @@ def plot_dbg_step(
     mu_s = np.asarray(mu_s).reshape(-1)
     std_s = np.exp(np.asarray(log_std_s).reshape(-1))
 
-    axy = np.array([float(agent[0]), float(agent[1])])
+    axy = np.array([float(agent[0]), float(agent[1])], dtype=float)
     c_net = axy + mu[:2]
     c_tgt = axy + mu_s[:2]
 
-    ax.arrow(axy[0], axy[1], c_net[0]-axy[0], c_net[1]-axy[1],
-             length_includes_head=True, head_width=0.15, alpha=0.8,
-             color="steelblue", zorder=11)
-    ax.arrow(axy[0], axy[1], c_tgt[0]-axy[0], c_tgt[1]-axy[1],
-             length_includes_head=True, head_width=0.15, alpha=0.8,
-             color="orange", zorder=11)
+    ax.arrow(
+        axy[0],
+        axy[1],
+        c_net[0] - axy[0],
+        c_net[1] - axy[1],
+        length_includes_head=True,
+        head_width=0.15,
+        alpha=0.8,
+        color="steelblue",
+        zorder=11,
+    )
+    ax.arrow(
+        axy[0],
+        axy[1],
+        c_tgt[0] - axy[0],
+        c_tgt[1] - axy[1],
+        length_includes_head=True,
+        head_width=0.15,
+        alpha=0.8,
+        color="orange",
+        zorder=11,
+    )
 
-    w_net = 2.0 * nsig * float(std[0]);  h_net = 2.0 * nsig * float(std[1])
-    w_tgt = 2.0 * nsig * float(std_s[0]); h_tgt = 2.0 * nsig * float(std_s[1])
+    w_net = 2.0 * nsig * float(std[0])
+    h_net = 2.0 * nsig * float(std[1])
+    w_tgt = 2.0 * nsig * float(std_s[0])
+    h_tgt = 2.0 * nsig * float(std_s[1])
 
-    ax.add_patch(Ellipse((c_net[0], c_net[1]), w_net, h_net,
-                         angle=0.0, fill=False, linewidth=2,
-                         edgecolor="steelblue", alpha=0.9, label="Net (μ,σ)"))
-    ax.add_patch(Ellipse((c_tgt[0], c_tgt[1]), w_tgt, h_tgt,
-                         angle=0.0, fill=False, linewidth=2,
-                         edgecolor="orange", alpha=0.9, label="Target (μ*,σ*)"))
+    ax.add_patch(
+        Ellipse(
+            (c_net[0], c_net[1]),
+            w_net,
+            h_net,
+            angle=0.0,
+            fill=False,
+            linewidth=2,
+            edgecolor="steelblue",
+            alpha=0.9,
+            label="Net (μ,σ)",
+        )
+    )
+    ax.add_patch(
+        Ellipse(
+            (c_tgt[0], c_tgt[1]),
+            w_tgt,
+            h_tgt,
+            angle=0.0,
+            fill=False,
+            linewidth=2,
+            edgecolor="orange",
+            alpha=0.9,
+            label="Target (μ*,σ*)",
+        )
+    )
 
     # --- extra text: v, v*, reward, MC return-to-go (assumed present later) ---
-    r_t = float(dbg.get("rewards", [np.nan]*len(roots))[k])
-    g_mc = float(dbg.get("mc_return", [np.nan]*len(roots))[k])
+    r_t = float(dbg.get("rewards", [np.nan] * len(roots))[k])
+    g_mc = float(dbg.get("mc_return", [np.nan] * len(roots))[k])
 
     ax.text(
-        0.02, 0.98,
+        0.02,
+        0.98,
         f"v={float(v):.3f}\nv*={float(v_s):.3f}\nr_t={r_t:.3f}\nG_mc={g_mc:.3f}",
-        transform=ax.transAxes, va="top", fontsize=10
+        transform=ax.transAxes,
+        va="top",
+        fontsize=10,
     )
 
     # --- zoom logic (focus on tree) ---
@@ -583,15 +703,15 @@ def plot_dbg_step(
         xmax, ymax = pts.max(axis=0)
 
         # ensure minimum span
-        cx = 0.5 * (xmin + xmax)
-        cy = 0.5 * (ymin + ymax)
+        cx0 = 0.5 * (xmin + xmax)
+        cy0 = 0.5 * (ymin + ymax)
         span_x = max(xmax - xmin, min_zoom_span)
         span_y = max(ymax - ymin, min_zoom_span)
 
-        xmin = cx - 0.5 * span_x - zoom_pad
-        xmax = cx + 0.5 * span_x + zoom_pad
-        ymin = cy - 0.5 * span_y - zoom_pad
-        ymax = cy + 0.5 * span_y + zoom_pad
+        xmin = cx0 - 0.5 * span_x - zoom_pad
+        xmax = cx0 + 0.5 * span_x + zoom_pad
+        ymin = cy0 - 0.5 * span_y - zoom_pad
+        ymax = cy0 + 0.5 * span_y + zoom_pad
 
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
