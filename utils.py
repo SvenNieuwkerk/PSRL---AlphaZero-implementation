@@ -6,6 +6,7 @@ import torch
 import math
 import torch.nn.functional as F
 from pprint import pprint
+from tqdm.auto import tqdm  # works in notebooks + scripts
 
 from plot_utils import decode_obs
 
@@ -601,6 +602,7 @@ def run_eval_episodes(
     goal_reward: float = 100.0,
     collision_reward: float = -100.0,
     gamma_mc: float = 0.99,
+    show_progress: bool = True,
 ) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
     """
     Eval over multiple seeds.
@@ -617,7 +619,12 @@ def run_eval_episodes(
 
     traces: Dict[int, Dict[str, Any]] = {}
 
-    for i, seed in enumerate(seeds):
+    seeds_iter = tqdm(seeds, desc="Seeds", leave=True) if show_progress else seeds
+
+    for i, seed in enumerate(seeds_iter):
+        if show_progress:
+            seeds_iter.set_postfix_str(f"seed={int(seed)}")
+
         obs, info = env_eval.reset(seed=int(seed))
         coin = bool(getattr(env_eval.unwrapped, "_coin_collected", False))
 
@@ -638,9 +645,15 @@ def run_eval_episodes(
         ep_len = 0
         terminal_reward: Optional[float] = None
 
-        for _t in range(int(max_steps)):
+        step_iter = tqdm(range(int(max_steps)), desc=f"t (seed={int(seed)})",
+                         leave=False) if show_progress else range(int(max_steps))
+
+        for _t in step_iter:
             root = planner.search(obs, coin_collected=coin)
             action = planner.act(root, training=False)
+
+            if show_progress:
+                step_iter.set_postfix_str(f"t={_t}")
 
             mu, log_std, v = planner._policy_value(obs)
             mu_star, log_std_star, v_star = planner.targets_from_root(root)
