@@ -183,9 +183,10 @@ def plot_mcts_tree_xy_limited(
     show_coin_radius=True,
     edge_color="0.25",
     chosen_edge_color=None,
-    nonterminal_node_color=None,
+    nonterminal_node_color="tab:purple",
     terminal_node_color="tab:red",
     unsafe_node_color="tab:orange",
+    plot_center = None
 ):
     obs = root.state
     agent, goal, obstacles, coin, dim = decode_obs(
@@ -226,6 +227,11 @@ def plot_mcts_tree_xy_limited(
     stack = [(root, 0)]
     seen = set()
 
+
+    #Make ids
+    node_id = {}
+    next_id = 1
+
     while stack:
         node, depth = stack.pop()
         nid = id(node)
@@ -246,6 +252,11 @@ def plot_mcts_tree_xy_limited(
             edges.append((node, child, is_chosen))
             stack.append((child, depth + 1))
 
+            cid = id(child)
+            if cid not in node_id:
+                node_id[cid] = next_id
+                next_id += 1
+
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
@@ -254,8 +265,9 @@ def plot_mcts_tree_xy_limited(
             plt.Circle((float(xy[0]), float(xy[1])), float(r), alpha=0.25)
         )
 
-    ax.scatter(goal_xy[0], goal_xy[1], s=120, marker="*", label="Goal", zorder=6)
+
     if show_goal_radius and goal_radius is not None:
+        ax.scatter(goal_xy[0], goal_xy[1], s=120, marker="*", label="Goal", zorder=6)
         ax.add_patch(
             plt.Circle(
                 (goal_xy[0], goal_xy[1]),
@@ -268,8 +280,8 @@ def plot_mcts_tree_xy_limited(
         )
 
     if coin_xy is not None:
-        ax.scatter(coin_xy[0], coin_xy[1], s=90, marker="o", label="Coin", zorder=6)
         if show_coin_radius and coin_radius is not None:
+            ax.scatter(coin_xy[0], coin_xy[1], s=90, marker="o", label="Coin", zorder=6)
             ax.add_patch(
                 plt.Circle(
                     (coin_xy[0], coin_xy[1]),
@@ -281,7 +293,7 @@ def plot_mcts_tree_xy_limited(
                 )
             )
 
-    ax.scatter(agent_xy[0], agent_xy[1], s=90, label="Agent (obs)", zorder=7)
+    #ax.scatter(agent_xy[0], agent_xy[1], s=90, label="Agent (obs)", zorder=7)
 
     drew_chosen_label = False
     if chosen_edge_color is None:
@@ -316,9 +328,21 @@ def plot_mcts_tree_xy_limited(
     xs_nt, ys_nt = [], []
     xs_t, ys_t = [], []
     xs_u, ys_u = [], []
+    xs_p, ys_p = [], []
+
+    # ID's found
+    projection_list = [17, 1, 2, 16, 10, 6, 13, 9, 7, 11, 21, 12]
+    unsafe_list = [25, 23, 26, 24, 29, 27, 22, 28, 32, 30, 33, 31]
+
+    id_to_xy = {}
 
     for _, child, _ in edges:
         x, y = node_xy(child)
+
+        cid = id(child)
+        id_n = node_id[cid]
+
+        id_to_xy[id_n] = (x,y)
 
         # unsafe overrides terminal coloring
         if is_projected_unsafe(child):
@@ -327,12 +351,15 @@ def plot_mcts_tree_xy_limited(
         elif is_terminal(child):
             xs_t.append(x)
             ys_t.append(y)
+        elif id_n in projection_list:
+            xs_p.append(x)
+            ys_p.append(y)
         else:
             xs_nt.append(x)
             ys_nt.append(y)
 
     xr, yr = node_xy(root)
-    ax.scatter([xr], [yr], s=90, marker="s", label="MCTS root", zorder=8)
+    ax.scatter([xr], [yr], s=90, marker="s", label="MCTS root", zorder=8, color = "tab:green")
 
     if xs_nt:
         ax.scatter(
@@ -340,9 +367,20 @@ def plot_mcts_tree_xy_limited(
             ys_nt,
             s=18,
             alpha=0.45,
-            label="Tree nodes",
+            label="Regular nodes",
             zorder=4,
             **({} if nonterminal_node_color is None else {"color": nonterminal_node_color}),
+        )
+
+    if xs_p:
+        ax.scatter(
+            xs_p,
+            ys_p,
+            s=18,
+            alpha=0.45,
+            label="Projected nodes",
+            zorder=4,
+            **({} if terminal_node_color is None else {"color": terminal_node_color}),
         )
 
     if xs_t:
@@ -363,7 +401,7 @@ def plot_mcts_tree_xy_limited(
             s=26,
             alpha=0.85,
             color=unsafe_node_color,
-            label="Projected unsafe",
+            label="Unsafe nodes",
             zorder=6,
         )
 
@@ -391,8 +429,30 @@ def plot_mcts_tree_xy_limited(
         ax.set_xlim(xmin - pad, xmax + pad)
         ax.set_ylim(ymin - pad, ymax + pad)
     else:
-        ax.set_xlim(-L, L)
-        ax.set_ylim(-L, L)
+        if plot_center is None:
+            cx, cy = 0.0, 0.0
+        else:
+            cx, cy = plot_center
+
+        ax.set_xlim(cx - L, cx + L)
+        ax.set_ylim(cy - L, cy + L)
+
+    for pid, uid in zip(projection_list, unsafe_list):
+        if pid in id_to_xy and uid in id_to_xy:
+            cod_0 = id_to_xy[pid]
+            x0, y0 = cod_0[0], cod_0[1]
+            cod_1 = id_to_xy[uid]
+            x1, y1 = cod_1[0], cod_1[1]
+
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.7,
+                zorder=5,
+                color="tab:red",
+            )
 
     ax.set_aspect("equal", adjustable="box")
     if title:
