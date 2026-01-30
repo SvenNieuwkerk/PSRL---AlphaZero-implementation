@@ -1,5 +1,8 @@
 import math
 import numpy as np
+import pickle
+import os
+import ipywidgets
 
 def confidence_intervals(data_line, bootstrap_resamples = 5000):
     """
@@ -33,6 +36,31 @@ def confidence_intervals(data_line, bootstrap_resamples = 5000):
 
     return lines
 
-data = np.random.randn(50, 20)
-lines = confidence_intervals(data)
-#print(lines)
+def extracts_from_traces(list_of_traces):
+    """
+    Assuming traces is a list of dictonairies
+    """
+    #list_of_traces is T long, where T is the number of evaluation periods
+    T = len(list_of_traces)
+    #Every dictonairy has N keys, where N is the number of evaluation runs
+    N = len(list_of_traces[0].keys())
+    for t, traces in enumerate(list_of_traces):
+        for i, key in enumerate(traces.keys()):
+            trace = traces[key]
+
+            length_episode = len(trace["actions"])
+            accumalitive_reward = trace["rewards"].sum()
+            average_reward_per_step_episode = accumalitive_reward / length_episode
+            mc_reward = trace["mc_return"].avg() #What is this
+            success = trace["reward"][-1]>50
+            collision = trace["reward"][-1]<50
+            max_steps = not(success or collision)
+
+            #store in data_matrix[i,t], #maybe a dictonairy that stores all datamatrices?
+
+    #For all datamatrices
+    #plot_data confidence_intervals(data_matrix)
+
+    #Maybe store all plot data in one dictonairy
+
+

@@ -8,3 +8,6 @@ __pycache__/
 
 # Jupyter autosaves
 .ipynb_checkpoints/
+
+#slim files
+slim/
