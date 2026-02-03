@@ -55,7 +55,7 @@ set_global_seeds(RNG_SEED)
 BASE_DIR = "eval_checkpoints"
 os.makedirs(BASE_DIR, exist_ok=True)
 
-run_name = f"ckpt_3D_exploration_AC_stepwise_gamma095{time.strftime('%d%m%Y_%H%M%S', time.localtime())}"
+run_name = f"ckpt_3D_exploration_AC_stepwise_gamma095_{time.strftime('%d%m%Y_%H%M%S', time.localtime())}"
 EVAL_DIR = os.path.join(BASE_DIR, run_name)
 os.makedirs(EVAL_DIR, exist_ok=True)
 
