@@ -1,0 +1,5 @@
+{
+  "__base__": "base.json",
+  "run": { "experiment_name": "temp_0p2" },
+  "mcts": { "temperature": 0.2 }
+}

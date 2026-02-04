@@ -1,0 +1,5 @@
+{
+  "__base__": "base.json",
+  "run": { "experiment_name": "sims_400" },
+  "mcts": { "num_simulations": 400 }
+}

@@ -851,3 +851,260 @@ def grow_replay(replay: ReplayBufferHybrid, new_capacity: int, *, keep_last: int
     new_replay.ptr = n_copy % new_capacity  # next write goes after the copied block
 
     return new_replay
+
+
+# =========================
+# Evaluation helpers
+# =========================
+
+def serialize_mcts_tree(
+    root,
+    *,
+    num_obstacles: int,
+    state_mode: str = "full",   # "full" | "agentpos" | "none"
+    dtype_f: Any = np.float32,
+) -> Dict[str, np.ndarray]:
+    """
+    Serialize a full-depth MCTS tree rooted at `root` into compact numpy arrays.
+
+    Why:
+      - pickling `root` stores huge Python object graphs -> GB files
+      - this stores the same info in arrays -> much smaller + compressible
+
+    state_mode:
+      - "full": store node_state (obs_dim)
+      - "agentpos": store node_agent_pos (dim 2/3 decoded from obs)
+      - "none": store no per-node state/position
+
+    Returns dict of numpy arrays:
+      node_N, node_is_terminal, node_is_projected_unsafe, node_terminal_value,
+      plus node_state or node_agent_pos (optional),
+      and edge_* arrays: parent_idx, child_idx, action, r_sa, N_sa, Q_sa, P_sa
+    """
+    if state_mode not in ("full", "agentpos", "none"):
+        raise ValueError(f"state_mode must be one of: full|agentpos|none (got {state_mode})")
+
+    # BFS/DFS assigning ids
+    node_id: Dict[int, int] = {id(root): 0}
+    nodes: List[Any] = [root]
+    q: List[Any] = [root]
+
+    edge_parent: List[int] = []
+    edge_child: List[int] = []
+    edge_action: List[np.ndarray] = []
+    edge_r_sa: List[float] = []
+    edge_N_sa: List[int] = []
+    edge_Q_sa: List[float] = []
+    edge_P_sa: List[float] = []
+
+    while q:
+        node = q.pop()
+        pid = node_id[id(node)]
+
+        # node.children is List[Child] where Child has action, child_node, r_sa, N_sa, Q_sa, P_sa :contentReference[oaicite:2]{index=2}
+        for ch in getattr(node, "children", []):
+            child = ch.child_node
+
+            if id(child) not in node_id:
+                node_id[id(child)] = len(nodes)
+                nodes.append(child)
+                q.append(child)
+
+            cid = node_id[id(child)]
+
+            edge_parent.append(pid)
+            edge_child.append(cid)
+            edge_action.append(np.asarray(ch.action, dtype=dtype_f))
+            edge_r_sa.append(float(getattr(ch, "r_sa", 0.0)))
+            edge_N_sa.append(int(getattr(ch, "N_sa", 0)))
+            edge_Q_sa.append(float(getattr(ch, "Q_sa", 0.0)))
+            edge_P_sa.append(float(getattr(ch, "P_sa", 0.0)))
+
+    # Node arrays
+    node_N = np.asarray([int(getattr(n, "N", 0)) for n in nodes], dtype=np.int32)
+    node_is_terminal = np.asarray([bool(getattr(n, "is_terminal", False)) for n in nodes], dtype=np.bool_)
+
+    # Optional bool: store as int8 with -1 for None
+    unsafe_raw = [getattr(n, "is_projected_unsafe", None) for n in nodes]
+    node_is_projected_unsafe = np.asarray(
+        [-1 if v is None else (1 if bool(v) else 0) for v in unsafe_raw],
+        dtype=np.int8,
+    )
+
+    term_val_raw = [getattr(n, "terminal_value", None) for n in nodes]
+    node_terminal_value = np.asarray(
+        [np.nan if v is None else float(v) for v in term_val_raw],
+        dtype=dtype_f,
+    )
+
+    out: Dict[str, np.ndarray] = {
+        "node_N": node_N,
+        "node_is_terminal": node_is_terminal,
+        "node_is_projected_unsafe": node_is_projected_unsafe,
+        "node_terminal_value": node_terminal_value,
+        "edge_parent": np.asarray(edge_parent, dtype=np.int32),
+        "edge_child": np.asarray(edge_child, dtype=np.int32),
+        "edge_r_sa": np.asarray(edge_r_sa, dtype=dtype_f),
+        "edge_N_sa": np.asarray(edge_N_sa, dtype=np.int32),
+        "edge_Q_sa": np.asarray(edge_Q_sa, dtype=dtype_f),
+        "edge_P_sa": np.asarray(edge_P_sa, dtype=dtype_f),
+    }
+
+    # Edge action is 2D array
+    if len(edge_action) > 0:
+        out["edge_action"] = np.stack(edge_action, axis=0).astype(dtype_f, copy=False)
+    else:
+        out["edge_action"] = np.zeros((0, 0), dtype=dtype_f)
+
+    # Node state / pos
+    if state_mode == "full":
+        # node.state is the observation vector (state) :contentReference[oaicite:3]{index=3}
+        node_state = np.stack([np.asarray(n.state, dtype=dtype_f) for n in nodes], axis=0)
+        out["node_state"] = node_state
+
+    elif state_mode == "agentpos":
+        # decode_obs comes from plot_utils, already imported in utils.py :contentReference[oaicite:4]{index=4}
+        agent_pos = []
+        dim_val: Optional[int] = None
+        for n in nodes:
+            agent, _, _, _, dim = decode_obs(np.asarray(n.state), num_obstacles=num_obstacles)
+            dim_val = int(dim)
+            agent_pos.append([float(agent[i]) for i in range(dim_val)])
+        out["node_agent_pos"] = np.asarray(agent_pos, dtype=dtype_f)
+        out["dim"] = np.asarray([dim_val if dim_val is not None else -1], dtype=np.int32)
+
+    return out
+
+
+def pack_serialized_trees(trees: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+    """
+    Pack a list of per-step serialized trees into one set of concatenated arrays + offsets.
+
+    Output contains:
+      step_node_offsets: (T+1,) offsets into concatenated node arrays
+      step_edge_offsets: (T+1,) offsets into concatenated edge arrays
+      plus concatenated node_* and edge_* arrays
+
+    This avoids writing one file per step and stays very compact with np.savez_compressed.
+    """
+    if len(trees) == 0:
+        return {
+            "step_node_offsets": np.asarray([0], dtype=np.int32),
+            "step_edge_offsets": np.asarray([0], dtype=np.int32),
+        }
+
+    # Determine which node fields exist
+    node_keys = [k for k in trees[0].keys() if k.startswith("node_")]
+    edge_keys = [k for k in trees[0].keys() if k.startswith("edge_")]
+    extra_keys = [k for k in trees[0].keys() if k not in node_keys and k not in edge_keys]
+
+    step_node_offsets = [0]
+    step_edge_offsets = [0]
+
+    packed: Dict[str, List[np.ndarray]] = {k: [] for k in node_keys + edge_keys + extra_keys}
+
+    node_total = 0
+    edge_total = 0
+
+    for tr in trees:
+        # offsets
+        nn = int(tr["node_N"].shape[0])
+        ne = int(tr["edge_parent"].shape[0]) if "edge_parent" in tr else 0
+        node_total += nn
+        edge_total += ne
+        step_node_offsets.append(node_total)
+        step_edge_offsets.append(edge_total)
+
+        for k in node_keys + edge_keys:
+            packed[k].append(tr[k])
+
+        for k in extra_keys:
+            # extras are usually tiny (e.g. dim shape (1,))
+            packed[k].append(tr[k])
+
+    out: Dict[str, np.ndarray] = {
+        "step_node_offsets": np.asarray(step_node_offsets, dtype=np.int32),
+        "step_edge_offsets": np.asarray(step_edge_offsets, dtype=np.int32),
+    }
+
+    # concatenate arrays
+    for k in node_keys + edge_keys:
+        out[k] = np.concatenate(packed[k], axis=0) if len(packed[k]) else np.asarray([], dtype=np.float32)
+
+    # extras: if scalar/1d, we concatenate
+    for k in extra_keys:
+        out[k] = np.concatenate(packed[k], axis=0) if len(packed[k]) else np.asarray([], dtype=np.int32)
+
+    return out
+
+
+def make_slim_trace(
+    tr: dict,
+    *,
+    num_obstacles: int,
+    goal_reward: float = 100.0,
+    collision_reward: float = -100.0,
+    tol: float = 1e-6,
+    include_chosen_idx: bool = True,
+) -> dict:
+    """
+    Lightweight episode trace for path plotting / success detection.
+
+    Keeps:
+      - rewards
+      - agent_pos trajectory (2D/3D)
+      - static goal_pos, obstacles, coin_pos, dim
+      - terminal flags + basic scalars
+      - (optional) chosen_idx for step-by-step correspondence with tree plots
+    """
+    states = tr["states"]
+    rewards = [float(r) for r in tr["rewards"]]
+
+    agent0, goal, obstacles, coin, dim = decode_obs(np.asarray(states[0]), num_obstacles=num_obstacles)
+    dim = int(dim)
+
+    goal_pos = [float(goal[i]) for i in range(dim)]
+
+    obstacles_arr = np.asarray(obstacles, dtype=float)
+    if obstacles_arr.ndim == 2 and obstacles_arr.shape[1] >= dim + 1:
+        obstacles_slim = obstacles_arr[:, list(range(dim)) + [-1]].tolist()
+    else:
+        obstacles_slim = obstacles_arr.tolist()
+
+    coin_pos = None
+    if coin is not None:
+        coin_pos = [float(coin[i]) for i in range(dim)]
+
+    agent_pos = []
+    for s in states:
+        a, _, _, _, _ = decode_obs(np.asarray(s), num_obstacles=num_obstacles)
+        agent_pos.append([float(a[i]) for i in range(dim)])
+
+    ep_len = len(rewards)
+    total_return = float(sum(rewards))
+    last_reward = float(rewards[-1]) if rewards else 0.0
+
+    terminated_goal = abs(last_reward - goal_reward) <= tol
+    terminated_crash = abs(last_reward - collision_reward) <= tol
+    terminated_timeout = (not terminated_goal) and (not terminated_crash)
+
+    out = {
+        "seed": int(tr["seed"]),
+        "dim": dim,
+        "ep_len": int(ep_len),
+        "total_return": float(total_return),
+        "last_reward": float(last_reward),
+        "terminated_goal": bool(terminated_goal),
+        "terminated_crash": bool(terminated_crash),
+        "terminated_timeout": bool(terminated_timeout),
+        "rewards": rewards,
+        "agent_pos": agent_pos,
+        "goal_pos": goal_pos,
+        "obstacles": obstacles_slim,
+        "coin_pos": coin_pos,
+    }
+
+    if include_chosen_idx and "chosen_idx" in tr:
+        out["chosen_idx"] = [int(x) for x in tr["chosen_idx"]]
+
+    return out

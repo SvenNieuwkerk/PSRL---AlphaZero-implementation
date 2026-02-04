@@ -1,6 +1,7 @@
 # Ignore debug traces folder anywhere
 **/debug_traces/
 **/eval_traces*/
+**/runs/
 
 # Python cache
 __pycache__/

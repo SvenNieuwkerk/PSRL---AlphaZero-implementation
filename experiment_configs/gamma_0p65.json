@@ -1,0 +1,5 @@
+{
+  "__base__": "base.json",
+  "run": { "experiment_name": "gamma_0p65" },
+  "mcts": { "gamma_mcts": 0.65 }
+}

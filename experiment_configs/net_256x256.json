@@ -1,0 +1,5 @@
+{
+  "__base__": "base.json",
+  "run": { "experiment_name": "net_256x256" },
+  "net": { "hidden_sizes": [256, 256] }
+}

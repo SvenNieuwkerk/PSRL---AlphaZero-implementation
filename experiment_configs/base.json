@@ -1,0 +1,81 @@
+{
+  "run": {
+    "experiment_name": "base",
+    "seed": 42,
+    "device": "cpu",
+    "deterministic_torch": true
+  },
+  "env": {
+    "max_episode_steps": 300
+  },
+  "mcts": {
+    "num_simulations": 200,
+    "cpuct": 1.0,
+    "max_depth": 64,
+    "temperature": 0.5,
+    "pw_k": 2.0,
+    "pw_alpha": 0.5,
+    "gamma_mcts": 0.85
+  },
+  "action_sampling": {
+    "K_uniform_per_node": 8,
+    "warmstart_steps": 20000,
+    "novelty_eps": 0.001,
+    "novelty_metric": "l2",
+    "num_candidates": 1,
+    "diversity_lambda": 0.0,
+    "diversity_sigma": 0.25,
+    "policy_beta": 1.0,
+    "max_resample_attempts": 16
+  },
+  "net": {
+    "hidden_sizes": [128, 128]
+  },
+  "optim": {
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001
+  },
+  "loss": {
+    "value_loss_weight": 1.0,
+    "policy_loss_weight": 1.0,
+    "value_target": "mcts"
+  },
+  "replay": {
+    "capacity": 500,
+    "K_max": 16
+  },
+  "train": {
+    "total_env_steps": 200000,
+    "train_updates_per_step": 1,
+    "min_replay_factor": 10,
+    "grad_clip_norm": 1.0
+  },
+  "eval": {
+    "eval_every_steps": 10000,
+    "eval_episodes": 50
+  },
+  "schedules": {
+    "lr": [
+      { "step": 0, "value": 0.0003 },
+      { "step": 20000, "value": 0.00025 },
+      { "step": 60000, "value": 0.0002 },
+      { "step": 120000, "value": 0.00015 }
+    ],
+    "replay": [
+      { "step": 0, "capacity": 500, "batch_size": 32 },
+      { "step": 20000, "capacity": 2000, "batch_size": 32 },
+      { "step": 60000, "capacity": 5000, "batch_size": 64 },
+      { "step": 120000, "capacity": 10000, "batch_size": 64 }
+    ],
+    "bootstrap": {
+      "enabled": true,
+      "start_step": null
+    }
+  },
+  "output": {
+    "root_dir": "runs",
+    "save_checkpoints": true,
+    "checkpoint_every_steps": 10000,
+    "save_config_json": true
+  }
+}

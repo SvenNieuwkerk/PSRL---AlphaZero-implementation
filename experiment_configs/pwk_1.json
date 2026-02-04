@@ -1,0 +1,5 @@
+{
+  "__base__": "base.json",
+  "run": { "experiment_name": "pwk_1" },
+  "mcts": { "pw_k": 1.0 }
+}

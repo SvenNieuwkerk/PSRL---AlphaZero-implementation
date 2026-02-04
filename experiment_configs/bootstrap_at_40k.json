@@ -1,0 +1,7 @@
+{
+  "__base__": "base.json",
+  "run": { "experiment_name": "bootstrap_at_40k" },
+  "schedules": {
+    "bootstrap": { "enabled": true, "start_step": 40000 }
+  }
+}
