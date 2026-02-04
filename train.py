@@ -51,7 +51,7 @@ def set_global_seeds(seed: int, deterministic_torch: bool = True):
 
 
 # -------------------------
-# Run directory naming
+# Run directory naming and print helpers
 # -------------------------
 def short_config_hash(cfg: ExperimentConfig) -> str:
     blob = json.dumps(asdict(cfg), sort_keys=True).encode("utf-8")
@@ -63,6 +63,20 @@ def make_run_dir(cfg: ExperimentConfig) -> Path:
     h = short_config_hash(cfg)
     name = f"{cfg.run.experiment_name}__{ts}__seed{cfg.run.seed}__{h}"
     return Path(cfg.output.root_dir) / name
+
+def format_hms(seconds: float) -> str:
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def make_log_prefix(cfg: ExperimentConfig, env_variant: str, run_dir) -> str:
+    # run_dir is .../<parent>/<2d|3d>
+    parent = Path(run_dir).parent.name  # e.g. base__seed42__9567da53
+    short = parent.split("__")[-1] if "__" in parent else parent
+    pid = os.getpid()
+    return f"[{cfg.run.experiment_name}|{env_variant}|{short}|pid{pid}]"
 
 
 # -------------------------
@@ -299,7 +313,8 @@ def train_one(cfg: ExperimentConfig, run_dir: Path, env_variant: str):
     set_bootstrap_state(planner, cfg, global_step)
 
     start_time = time.perf_counter()
-    print(f"START TRAINING | device={device} | run_dir={run_dir}")
+    prefix = make_log_prefix(cfg, env_variant, run_dir)
+    print(f"{prefix} START TRAINING | device={device} | run_dir={run_dir}")
 
     batch_size = cfg.schedules.replay[0].batch_size if cfg.schedules.replay else 32
 
@@ -384,7 +399,7 @@ def train_one(cfg: ExperimentConfig, run_dir: Path, env_variant: str):
                 ckpt_path,
             )
             elapsed = time.perf_counter() - start_time
-            print(f"[step {global_step}] saved {ckpt_path.name} | elapsed={elapsed:.1f}s")
+            print(f"{prefix} step={global_step} saved={ckpt_path.name} elapsed={format_hms(elapsed)}")
 
     env_real.close()
     env_sim.close()
