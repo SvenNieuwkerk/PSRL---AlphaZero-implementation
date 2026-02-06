@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from collections import defaultdict
 import argparse
 import subprocess
 import sys
@@ -87,7 +88,22 @@ def main():
         return
 
     every_n = max(1, int(args.every_n))
-    selected = [x for i, x in enumerate(all_ckpts) if (i % every_n == 0)]
+
+    # group checkpoints by run_dir
+    by_run = defaultdict(list)
+    for ckpt_path, env_variant in all_ckpts:
+        run_dir = ckpt_path.parent.parent  # .../<run>/<env>
+        by_run[(run_dir, env_variant)].append(ckpt_path)
+
+    selected = []
+
+    for (_run_dir, env_variant), ckpts in by_run.items():
+        # ckpts are already sorted
+        n = len(ckpts)
+        idxs = list(range(n - 1, -1, -every_n))  # always include last
+        idxs = sorted(idxs)
+        for i in idxs:
+            selected.append((ckpts[i], env_variant))
 
     jobs: List[Tuple[str, str]] = []
     for ckpt_path, env_variant in selected:

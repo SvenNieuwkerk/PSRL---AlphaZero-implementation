@@ -8,4 +8,4 @@ __pycache__/
 *.pyc
 
 # Jupyter autosaves
-.ipynb_checkpoints/
+**/.ipynb_checkpoints/

@@ -1,10 +1,19 @@
 # train.py
 from __future__ import annotations
 
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 import argparse
 import hashlib
 import json
-import os
 import random
 import time
 from dataclasses import asdict
@@ -12,7 +21,6 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
-import torch
 import torch.optim as optim
 
 import gymnasium as gym
